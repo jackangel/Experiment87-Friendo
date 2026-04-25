@@ -89,7 +89,7 @@ class FoveaBlock(nn.Module):
     def forward(self, x, freqs_cis):
         B, L, D = x.shape
         
-        # PRE-RMSNorm
+        # PRE-RMSNorm for Attention
         x_norm = self.ln1(x)
         
         # Multi-Head Attention reshaping
@@ -103,8 +103,14 @@ class FoveaBlock(nn.Module):
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         attn = attn.transpose(1, 2).reshape(B, L, D) # Flatten back to [B, L, D]
         
+        # Residual connection 1
         x = x + self.dropout(self.proj(attn))
-        x = x + self.dropout(self.mlp(self.ln2(x)))
+        
+        # PRE-RMSNorm for MLP (Standard Pre-Norm structure)
+        x_norm2 = self.ln2(x)
+        
+        # Residual connection 2
+        x = x + self.dropout(self.mlp(x_norm2))
         return x
 
 class FoveaCortex(nn.Module):
@@ -150,10 +156,17 @@ class LandmarkMemory(nn.Module):
         # --- 1. NEED-DRIVEN RESONANCE ---
         need = torch.sigmoid(self.uncertainty_gate(x))
         
-        if landmarks_k.size(1) > 0:
+        num_landmarks = landmarks_k.size(1)
+        if num_landmarks > 0:
             q_norm = F.normalize(x, dim=-1)
             k_norm = F.normalize(landmarks_k, dim=-1)
             resonance = torch.bmm(q_norm, k_norm.transpose(1, 2)) 
+            
+            # Inject Recency Bias (Solves the "Bag of Landmarks" problem)
+            # Creates a linear scale from 0.0 (oldest) to 1.0 (newest)
+            recency_bias = torch.linspace(0.0, 1.0, num_landmarks, device=x.device).view(1, 1, -1)
+            resonance = resonance + (recency_bias * 0.5) # Scale bias appropriately
+            
             attn = F.softmax(resonance * 5.0, dim=-1) 
             
             retrieved = torch.bmm(attn, landmarks_v) 
@@ -345,8 +358,12 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
             
             logits, memory_state, gate_penalty = model(x, memory_state, start_pos=0)
             
-            k, v = memory_state
-            memory_state = (k.detach(), v.detach())
+            # FIX: We MUST detach the memory state every step. 
+            # If we don't, the next iteration tries to backpropagate through a graph 
+            # that was already freed by the previous `loss.backward()` call, causing a RuntimeError.
+            if memory_state is not None:
+                k, v = memory_state
+                memory_state = (k.detach(), v.detach())
             
             ce_loss = F.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
             loss = ce_loss + (gate_penalty_weight * gate_penalty)
@@ -361,7 +378,7 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
             iteration += 1
             
             # Evaluate every 1000 steps
-            if iteration % 1000 == 0:
+            if iteration % 100 == 0:
                 avg_train_loss = running_train_loss / train_steps
                 
                 # Calculate Validation Loss
@@ -377,7 +394,7 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
                         val_loss = (v_ce + (gate_penalty_weight * v_gate)).item()
                     model.train()
                 
-                print(f"[Step {iteration}] Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | Landmarks: {memory_state[0].size(1)}")
+                print(f"[Step {iteration}] Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | Landmarks: {memory_state[0].size(1) if memory_state else 0}")
                 running_train_loss = 0.0
                 train_steps = 0
                 
@@ -387,11 +404,12 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
                 model.eval()
                 with torch.no_grad():
                     gen_mem = memory_state 
-                    context = x[:, :64] # Seed with current context
+                    context = x[:, :512] # Seed with current context (increased to 512)
                     generated_ids = context[0].tolist()
                     
                     for step in range(200):
-                        rolling_fovea = context[:, -64:] 
+                        # Increased rolling fovea to 512 for better short-term coherence
+                        rolling_fovea = context[:, -512:] 
                         gen_logits, gen_mem, _ = model(rolling_fovea, gen_mem, is_generating=True, start_pos=step)
                         
                         next_token_logits = gen_logits[0, -1]
@@ -407,6 +425,9 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
                         
                     print(f"{tokenizer.decode(generated_ids)}\n" + "="*40 + "\n")
                 model.train()
+                
+        torch.save(model.state_dict(), 'checkpoint.pth')
+        print("Model checkpoint saved to 'checkpoint.pth'.")
                 
     print("\nTraining Complete.")
     torch.save(model.state_dict(), 'checkpoint.pth')
@@ -431,7 +452,8 @@ def chat_mode(model, tokenizer, device):
             print("Brain: ", end="", flush=True)
             
             for step in range(100): 
-                rolling_fovea = context[:, -64:] if context.size(1) > 64 else context
+                # Increased rolling fovea to 512 for better chat coherence
+                rolling_fovea = context[:, -512:] if context.size(1) > 512 else context
                 gen_logits, memory_state, _ = model(rolling_fovea, memory_state, is_generating=True, start_pos=step)
                 
                 next_token_logits = gen_logits[0, -1]
@@ -469,7 +491,8 @@ if __name__ == "__main__":
     vocab_size = tokenizer.vocab_size
     print(f"Vocabulary Size: {vocab_size}")
     
-    model = ResonantBrain(vocab_size=vocab_size, d_model=256, dropout=0.1).to(device)
+    # Increased d_model to 512 to give the model a higher "Intellectual Ceiling"
+    model = ResonantBrain(vocab_size=vocab_size, d_model=512, dropout=0.1).to(device)
     
     # Calculate and display the total number of trainable parameters
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
