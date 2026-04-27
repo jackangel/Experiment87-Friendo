@@ -86,7 +86,7 @@ class LongContextAttention(nn.Module):
         # Learned gate to balance local (Fovea) and global (Landmark) attention
         self.memory_gate = nn.Parameter(torch.zeros(1))
         
-        # PRODUCTION FIX 1: Initialize decay to 0.95 in sigmoid space
+        # Initialize decay to 0.95 in sigmoid space
         # sigmoid(2.944) ≈ 0.95, giving 95% retention rate
         self.memory_decay = nn.Parameter(torch.tensor(2.944))
 
@@ -122,7 +122,7 @@ class LongContextAttention(nn.Module):
         if memory_state is not None:
             M_old, Z_old = memory_state
             
-            # PRODUCTION FIX 2: Monitor memory matrix norms BEFORE update
+            # Monitor memory matrix norms BEFORE update
             M_norm = M_old.norm().item()
             Z_norm = Z_old.norm().item()
             
@@ -163,7 +163,7 @@ class LongContextAttention(nn.Module):
         if memory_state is not None:
             M_old, Z_old = memory_state
             
-            # PRODUCTION FIX 3: Apply learned decay to prevent unbounded growth
+            # Apply learned decay to prevent unbounded growth
             # Sigmoid ensures decay is strictly between 0 and 1 (e.g., 0.95)
             decay = torch.sigmoid(self.memory_decay)
             
@@ -199,10 +199,10 @@ class LandmarkBlock(nn.Module):
         return x, new_memory_state
 
 class LandmarkTransformer(nn.Module):
-    def __init__(self, vocab_size, dim, num_heads, num_layers, max_seq_len=4096):
+    def __init__(self, vocab_size, dim, num_heads, num_layers, max_seq_len=512):
         super().__init__()
         
-        # PRODUCTION FIX 4: Warn if layer count is too low for production
+        # Warn if layer count is too low for production
         if num_layers < 6:
             print(f"⚠️  WARNING: num_layers={num_layers} is shallow. "
                   f"For coherent chat responses, use 6+ layers.")
@@ -218,19 +218,22 @@ class LandmarkTransformer(nn.Module):
         self.output.weight = self.tok_embeddings.weight
         
         self.head_dim = dim // num_heads
-        freqs_cis = precompute_freqs_cis(self.head_dim, max_seq_len * 2, max_train_len=max_seq_len)
+        self.max_seq_len = max_seq_len  # Store the chunk size
+        
+        # Pre-compute RoPE freqs for the max_seq_len (512 tokens)
+        freqs_cis = precompute_freqs_cis(self.head_dim, max_seq_len, max_train_len=max_seq_len)
         self.register_buffer("freqs_cis", freqs_cis)
 
-    def forward(self, x, start_pos=0, memory_states=None):
+    def forward(self, x, memory_states=None):
+        """
+        FIXED: Removed start_pos parameter. Always use positions 0 to seq_len-1.
+        This matches the block-recurrent training paradigm.
+        """
         h = self.tok_embeddings(x)
         seq_len = x.shape[1]
         
-        if start_pos + seq_len > self.freqs_cis.shape[0]:
-            new_length = start_pos + seq_len + 1000
-            new_freqs = precompute_freqs_cis(self.head_dim, new_length).to(x.device)
-            self.register_buffer("freqs_cis", new_freqs, persistent=False)
-            
-        chunk_freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len]
+        # Always use positions 0 to seq_len-1 (matching training)
+        chunk_freqs_cis = self.freqs_cis[:seq_len]
         
         new_memory_states = []
         if memory_states is None:
@@ -342,14 +345,101 @@ def stream_tokens_from_parquet(file, text_column, tokenizer, seq_len, device):
         print(f"Error streaming tokens from {file}: {e}")
 
 # =============================================================================
-# 5. TRAINING AND CHAT LOOPS
+# 5. BLOCK-RECURRENT GENERATION (FIXED)
+# =============================================================================
+
+def generate_block_recurrent(model, context_ids, tokenizer, device, max_new_tokens=256, 
+                             chunk_size=512, temperature=0.8, repetition_penalty=1.2,
+                             top_k=50, top_p=0.9):
+    """
+    Block-recurrent generation that matches training behavior:
+    - Accumulates tokens into chunks of size chunk_size
+    - Passes full chunks to model (not individual tokens)
+    - Uses positions 0 to chunk_size-1 for each chunk
+    - Only updates memory once per chunk
+    
+    This ensures:
+    - Local attention sees full chunk context
+    - RoPE positions match training (0-511)
+    - Memory update frequency matches training
+    """
+    model.eval()
+    
+    with torch.no_grad():
+        generated_ids = context_ids.copy()
+        memory_states = None
+        current_chunk = []
+        
+        # Pre-fill: Process initial context in chunks
+        context_tensor = torch.tensor(context_ids, dtype=torch.long).unsqueeze(0).to(device)
+        
+        # Process context in chunks to build up memory
+        for i in range(0, len(context_ids), chunk_size):
+            chunk = context_tensor[:, i:i+chunk_size]
+            if chunk.size(1) == 0:
+                continue
+                
+            logits, memory_states = model(chunk, memory_states=memory_states)
+            
+            # If this is the last chunk, keep it as our current chunk
+            if i + chunk_size >= len(context_ids):
+                current_chunk = context_ids[i:]
+        
+        # If context was empty or not chunk-aligned, start fresh
+        if not current_chunk:
+            current_chunk = context_ids[-min(len(context_ids), chunk_size):]
+        
+        # Generate new tokens
+        tokens_generated = 0
+        while tokens_generated < max_new_tokens:
+            # Convert current chunk to tensor
+            chunk_tensor = torch.tensor(current_chunk, dtype=torch.long).unsqueeze(0).to(device)
+            
+            # Forward pass through model
+            logits, memory_states = model(chunk_tensor, memory_states=memory_states)
+            
+            # Get logits for the last token in the chunk
+            next_token_logits = logits[0, -1].clone()
+            
+            # Apply sampling penalties
+            next_token_logits = apply_sampling_penalties(
+                next_token_logits, generated_ids, 
+                repetition_penalty=repetition_penalty,
+                top_k=top_k, 
+                top_p=top_p
+            )
+            
+            # Sample next token
+            probs = F.softmax(next_token_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, 1).item()
+            
+            generated_ids.append(next_token)
+            tokens_generated += 1
+            
+            # Add to current chunk
+            current_chunk.append(next_token)
+            
+            # Check stopping condition
+            if next_token == tokenizer.tokenizer.eot_token:
+                break
+            
+            # If chunk reaches chunk_size, commit memory and start new chunk
+            if len(current_chunk) >= chunk_size:
+                # Memory is already updated, start new chunk with overlap
+                # Keep last 128 tokens for context continuity
+                overlap = min(128, chunk_size // 4)
+                current_chunk = current_chunk[-overlap:]
+    
+    return generated_ids
+
+# =============================================================================
+# 6. TRAINING LOOP (UNCHANGED)
 # =============================================================================
 
 def run_training(model, parquet_files, text_column, tokenizer, optimizer, device, vocab_size, 
-                 start_iteration=0):
-    seq_len = 512 
+                 start_iteration=0, chunk_size=512):
     print(f"\n--- Starting Training | Device: {device} ---")
-    print(f"Starting from iteration: {start_iteration}")
+    print(f"Chunk size: {chunk_size} | Starting from iteration: {start_iteration}")
     
     iteration = start_iteration
     random.shuffle(parquet_files)
@@ -360,7 +450,7 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
         print(f"{'='*60}")
         memory_states = None 
         
-        token_stream = stream_tokens_from_parquet(file, text_column, tokenizer, seq_len, device)
+        token_stream = stream_tokens_from_parquet(file, text_column, tokenizer, chunk_size, device)
         running_train_loss = 0.0
         train_steps = 0
         
@@ -368,10 +458,10 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
             x = data_chunk[:, :-1]
             y = data_chunk[:, 1:]
             
-            # Forward pass
-            logits, memory_states = model(x, start_pos=0, memory_states=memory_states)
+            # Forward pass (no start_pos needed)
+            logits, memory_states = model(x, memory_states=memory_states)
             
-            # PRODUCTION FIX 5: Check for memory explosion and reset if needed
+            # Check for memory explosion and reset if needed
             memory_states, was_reset = reset_memory_if_exploded(memory_states)
             if was_reset:
                 print("⚠️  Continuing training with fresh memory...")
@@ -384,7 +474,7 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
             optimizer.zero_grad()
             loss.backward()
             
-            # PRODUCTION FIX 6: Clip memory_decay gradients separately to prevent instability
+            # Clip memory_decay gradients separately to prevent instability
             for layer in model.layers:
                 if hasattr(layer.attn, 'memory_decay'):
                     if layer.attn.memory_decay.grad is not None:
@@ -428,27 +518,18 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
             if iteration % 5000 == 0:
                 print("\n" + "="*60 + "\n🧠 INITIATING GENERATION (PREDICTION)...\n" + "="*60)
                 model.eval()
-                with torch.no_grad():
-                    gen_mem = memory_states 
-                    context = x[:, :256] 
-                    generated_ids = context[0].tolist()
-                    
-                    for step in range(200):
-                        rolling_fovea = context[:, -256:] 
-                        gen_logits, gen_mem = model(rolling_fovea, start_pos=step, memory_states=gen_mem)
-                        
-                        next_token_logits = gen_logits[0, -1]
-                        next_token_logits = apply_sampling_penalties(
-                            next_token_logits, generated_ids, repetition_penalty=1.2, top_k=50, top_p=0.9
-                        )
-                        
-                        probs = F.softmax(next_token_logits / 0.8, dim=-1)
-                        idx = torch.multinomial(probs, 1)
-                        
-                        generated_ids.append(idx.item())
-                        context = torch.cat([context, idx.unsqueeze(0)], dim=1)
-                        
-                    print(f"{tokenizer.decode(generated_ids)}\n" + "="*60 + "\n")
+                
+                # Take first 256 tokens as context
+                context_ids = x[0, :256].tolist()
+                
+                # Generate using block-recurrent method
+                generated_ids = generate_block_recurrent(
+                    model, context_ids, tokenizer, device,
+                    max_new_tokens=200, chunk_size=chunk_size,
+                    temperature=0.8, repetition_penalty=1.2
+                )
+                
+                print(f"{tokenizer.decode(generated_ids)}\n" + "="*60 + "\n")
                 model.train()
                 
         # Save checkpoint after each epoch
@@ -456,18 +537,23 @@ def run_training(model, parquet_files, text_column, tokenizer, optimizer, device
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'iteration': iteration,
-            'epoch': epoch
+            'epoch': epoch,
+            'chunk_size': chunk_size
         }
         torch.save(checkpoint, 'checkpoint.pth')
         print(f"✓ Checkpoint saved (iteration {iteration})")
 
-def chat_mode(model, tokenizer, device):
+# =============================================================================
+# 7. CHAT MODE (FIXED)
+# =============================================================================
+
+def chat_mode(model, tokenizer, device, chunk_size=512):
     print("\n" + "="*60 + "\n💬 ENTERING CHAT MODE\n" + "="*60)
     print("Type 'quit' or 'exit' to stop.")
     print("Type 'reset' to clear conversation memory.\n")
+    print(f"Using block-recurrent generation (chunk_size={chunk_size})")
     
     model.eval()
-    memory_states = None
     conversation_history = []
     
     with torch.no_grad():
@@ -479,7 +565,6 @@ def chat_mode(model, tokenizer, device):
                 break
             
             if user_input.lower() == 'reset':
-                memory_states = None
                 conversation_history = []
                 print("✓ Conversation memory cleared.")
                 continue
@@ -491,51 +576,39 @@ def chat_mode(model, tokenizer, device):
             conversation_history.append(f"User: {user_input}")
             full_context = "\n".join(conversation_history) + "\nAssistant:"
             
-            encoded_input = tokenizer.encode(full_context)
-            context = torch.tensor(encoded_input, dtype=torch.long).unsqueeze(0).to(device)
-            generated_ids = context[0].tolist()
+            context_ids = tokenizer.encode(full_context)
             
             print("Assistant: ", end="", flush=True)
             
-            response_tokens = []
-            for step in range(150): 
-                rolling_fovea = context[:, -512:] if context.size(1) > 512 else context
-                gen_logits, memory_states = model(rolling_fovea, start_pos=step, memory_states=memory_states)
-                
-                next_token_logits = gen_logits[0, -1]
-                next_token_logits = apply_sampling_penalties(
-                    next_token_logits, generated_ids, repetition_penalty=1.2, top_k=40, top_p=0.9
-                )
-                
-                probs = F.softmax(next_token_logits / 0.7, dim=-1)
-                idx = torch.multinomial(probs, 1)
-                
-                token_id = idx.item()
-                generated_ids.append(token_id)
-                response_tokens.append(token_id)
-                context = torch.cat([context, idx.unsqueeze(0)], dim=1)
-                
-                word = tokenizer.decode([token_id])
-                print(word, end="", flush=True)
-                
-                # Stop if we hit a natural break
-                if word.strip() in ['.', '!', '?', '\n']:
-                    # Check if we've generated enough
-                    if len(response_tokens) > 20:
-                        break
+            # Generate using block-recurrent method
+            generated_ids = generate_block_recurrent(
+                model, context_ids, tokenizer, device,
+                max_new_tokens=150, chunk_size=chunk_size,
+                temperature=0.7, repetition_penalty=1.2,
+                top_k=40, top_p=0.9
+            )
             
-            print()  # New line after response
+            # Extract and print only the new response
+            response_ids = generated_ids[len(context_ids):]
+            response_text = tokenizer.decode(response_ids)
+            
+            # Stop at sentence boundaries
+            for stop_char in ['.', '!', '?', '\n']:
+                if stop_char in response_text and len(response_text) > 20:
+                    response_text = response_text[:response_text.index(stop_char)+1]
+                    break
+            
+            print(response_text)
             
             # Add assistant response to history
-            assistant_response = tokenizer.decode(response_tokens)
-            conversation_history.append(f"Assistant: {assistant_response}")
+            conversation_history.append(f"Assistant: {response_text}")
             
             # Keep only last 10 exchanges to prevent context from growing too large
             if len(conversation_history) > 20:
                 conversation_history = conversation_history[-20:]
 
 # =============================================================================
-# 6. MODEL CONFIGURATIONS (PRODUCTION READY)
+# 8. MODEL CONFIGURATIONS
 # =============================================================================
 
 MODEL_CONFIGS = {
@@ -565,7 +638,7 @@ MODEL_CONFIGS = {
     }
 }
 
-def print_model_info(config_name, config, vocab_size):
+def print_model_info(config_name, config, vocab_size, chunk_size):
     """Print detailed model configuration information."""
     print(f"\n{'='*60}")
     print(f"MODEL CONFIGURATION: {config_name.upper()}")
@@ -577,15 +650,16 @@ def print_model_info(config_name, config, vocab_size):
     print(f"  • Number of Heads: {config['num_heads']}")
     print(f"  • Number of Layers: {config['num_layers']}")
     print(f"  • Head Dimension: {config['dim'] // config['num_heads']}")
+    print(f"  • Chunk Size: {chunk_size} tokens")
     print(f"{'='*60}\n")
 
 # =============================================================================
-# 7. MAIN ENTRY POINT
+# 9. MAIN ENTRY POINT
 # =============================================================================
 
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"🚀 ResonantBrain Production v2.0")
+    print(f"🚀 ResonantBrain Production v2.1 (Block-Recurrent Fixed)")
     print(f"Device: {device}")
     print(f"PyTorch Version: {torch.__version__}")
     
@@ -595,7 +669,8 @@ if __name__ == "__main__":
     PARQUET_DIR = r"I:\Datasets\Gutenberg-BookCorpus-Cleaned-Data-English_data" 
     TEXT_COLUMN = "text"   
     TIKTOKEN_ENCODING = "gpt2" 
-    MODEL_SIZE = 'medium'  # Options: 'tiny', 'small', 'medium', 'large'
+    MODEL_SIZE = 'large'  # Options: 'tiny', 'small', 'medium', 'large'
+    CHUNK_SIZE = 512  # Block-recurrent chunk size (must match training)
     
     # Advanced training settings
     LEARNING_RATE = 4e-4
@@ -608,17 +683,18 @@ if __name__ == "__main__":
     vocab_size = tokenizer.vocab_size
     config = MODEL_CONFIGS[MODEL_SIZE]
     
-    print_model_info(MODEL_SIZE, config, vocab_size)
+    print_model_info(MODEL_SIZE, config, vocab_size, CHUNK_SIZE)
     
-    # Create model
+    # Create model with chunk_size as max_seq_len
     model = LandmarkTransformer(
         vocab_size=vocab_size,
         dim=config['dim'],
         num_heads=config['num_heads'],
-        num_layers=config['num_layers']
+        num_layers=config['num_layers'],
+        max_seq_len=CHUNK_SIZE  # Set to match chunk size
     ).to(device)
     
-    # PRODUCTION FIX 8: Validate vocab size matches
+    # Validate vocab size matches
     validate_vocab_size(model, tokenizer)
     
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -648,15 +724,24 @@ if __name__ == "__main__":
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_iteration = checkpoint.get('iteration', 0)
+            saved_chunk_size = checkpoint.get('chunk_size', CHUNK_SIZE)
+            
+            if saved_chunk_size != CHUNK_SIZE:
+                print(f"⚠️  WARNING: Checkpoint was trained with chunk_size={saved_chunk_size}, "
+                      f"but current CHUNK_SIZE={CHUNK_SIZE}")
+                print("This may cause suboptimal results. Consider using the original chunk size.")
+            
             print(f"✓ Checkpoint loaded. Resuming from iteration {start_iteration}...")
             run_training(model, parquet_files, TEXT_COLUMN, tokenizer, optimizer, 
-                        device, vocab_size, start_iteration)
+                        device, vocab_size, start_iteration, CHUNK_SIZE)
         
         elif choice == 'chat':
             checkpoint = torch.load(checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
-            print("✓ Checkpoint loaded.")
-            chat_mode(model, tokenizer, device)
+            saved_chunk_size = checkpoint.get('chunk_size', CHUNK_SIZE)
+            
+            print(f"✓ Checkpoint loaded (trained with chunk_size={saved_chunk_size}).")
+            chat_mode(model, tokenizer, device, chunk_size=saved_chunk_size)
         
         else:
             print("Training from scratch...")
@@ -664,8 +749,8 @@ if __name__ == "__main__":
                 os.remove(checkpoint_path)
                 print(f"✓ Deleted old checkpoint.")
             run_training(model, parquet_files, TEXT_COLUMN, tokenizer, optimizer, 
-                        device, vocab_size, start_iteration)
+                        device, vocab_size, start_iteration, CHUNK_SIZE)
     else:
         print("\nNo checkpoint found. Starting training from scratch...")
         run_training(model, parquet_files, TEXT_COLUMN, tokenizer, optimizer, 
-                    device, vocab_size, start_iteration)
+                    device, vocab_size, start_iteration, CHUNK_SIZE)
