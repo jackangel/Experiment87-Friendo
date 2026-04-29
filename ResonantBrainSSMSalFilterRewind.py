@@ -81,7 +81,11 @@ class FFTCausalConv(nn.Module):
         H_freq = torch.fft.rfft(h_padded, n=2 * L)
         y = torch.fft.irfft(X_freq * H_freq, n=2 * L)[..., :L]
 
-        h_norm = torch.norm(h, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        # FIX: Use the infinite L2 norm of the decay filter so it is independent of sequence length L.
+        # Infinite sum of (e^(-alpha * t))^2 = 1 / (1 - e^(-2 * alpha))
+        h_norm_sq = 1.0 / (1.0 - torch.exp(-2.0 * alpha.unsqueeze(1)))
+        h_norm = torch.sqrt(h_norm_sq).clamp(min=1e-6)
+        
         y = y / h_norm
 
         if carry_state is not None:
@@ -671,7 +675,7 @@ if __name__ == "__main__":
     TEXT_COLUMN = "text"
     TIKTOKEN_ENCODING = "gpt2"
     MODEL_SIZE = 'medium'
-    CHUNK_SIZE = 512
+    CHUNK_SIZE = 1024
     LEARNING_RATE = 4e-4
     WEIGHT_DECAY = 0.01
 
