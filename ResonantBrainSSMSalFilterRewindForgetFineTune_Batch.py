@@ -203,70 +203,94 @@ class CognitiveForgettingGate(nn.Module):
             return x_gated
 
 # =============================================================================
-# 3.75. LSH RETRIEVAL ATTENTION
+# 3.75. BAYESIAN SIGNAL ATTENTION
 # =============================================================================
 
-class LSHRetrievalAttention(nn.Module):
-    """
-    Hybrid Attention using a Dense Local Window + LSH for Distant Memory Retrieval.
-    (Parallelized version, adapted for pre-computed Q, K, V)
-    """
-    def __init__(self, embed_dim, num_heads, local_window_size=128, num_hash_bits=4):
+class BayesianSignalAttention(nn.Module):
+    def __init__(self, d_model, num_heads, signal_window=2):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.local_window_size = local_window_size
-        self.num_hash_bits = num_hash_bits
-        
-        self.register_buffer(
-            "random_planes", 
-            torch.randn(num_heads, self.head_dim, num_hash_bits)
-        )
+        self.d_model = d_model
+        self.head_dim = d_model // num_heads
+        self.signal_window = signal_window
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
-    def get_hash_buckets(self, vectors):
-        projections = torch.matmul(vectors, self.random_planes)
-        bits = (projections > 0).long()
-        powers_of_two = 2 ** torch.arange(self.num_hash_bits, device=vectors.device)
-        bucket_ids = (bits * powers_of_two).sum(dim=-1)
-        return bucket_ids
-
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, freqs_cis_q, freqs_cis_k_blocks):
         B, H, L_q, D_h = q.shape
         _, _, L_k, _ = k.shape
-
-        k_hashes = self.get_hash_buckets(k)
-        q_hashes = self.get_hash_buckets(q)
-
-        # 1. Compute full attention scores for all pairs
-        # Shape: (B, H, L_q, L_k)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-
-        # 2. Build vectorized masks accounting for KV cache offset
+        
+        # Calculate the absolute position offset for the queries
         offset = L_k - L_q
-        idx_q = torch.arange(offset, offset + L_q, device=q.device)
-        idx_k = torch.arange(L_k, device=k.device)
         
-        dist = idx_q.unsqueeze(1) - idx_k.unsqueeze(0)  # Shape: (L_q, L_k)
+        # Pad K and V sequence to multiple of signal_window
+        pad_len = (self.signal_window - (L_k % self.signal_window)) % self.signal_window
+        if pad_len > 0:
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+            
+        padded_L_k = k.size(2)
+        M = padded_L_k // self.signal_window
         
-        # Causal mask: j <= i  =>  i - j >= 0
-        causal_mask = (dist >= 0).view(1, 1, L_q, L_k)
+        # Chunk K and V
+        k_chunks = k.view(B, H, M, self.signal_window, D_h)
+        v_chunks = v.view(B, H, M, self.signal_window, D_h)
         
-        # Local window mask: i - j < local_window_size
-        local_mask = (dist < self.local_window_size).view(1, 1, L_q, L_k)
+        # Block Means (Unrotated)
+        k_block_means = k_chunks.mean(dim=3) # (B, H, M, D_h)
+        v_block_means = v_chunks.mean(dim=3) # (B, H, M, D_h)
         
-        # Hash match mask: q_hashes == k_hashes
-        # q_hashes shape: (B, H, L_q, 1)
-        # k_hashes shape: (B, H, 1, L_k)
-        hash_match = (q_hashes.unsqueeze(-1) == k_hashes.unsqueeze(-2))
+        # Cumulative Means (Strictly Causal)
+        window_positions = torch.arange(1, self.signal_window + 1, device=q.device).view(1, 1, 1, -1, 1)
+        k_cum_means = k_chunks.cumsum(dim=3) / window_positions
+        v_cum_means = v_chunks.cumsum(dim=3) / window_positions
         
-        # 3. Combine masks: must be causal AND (either within local window OR hashes match)
-        active_mask = causal_mask & (local_mask | hash_match)
+        # Extract the exact cumulative mean for each query's position
+        k_cum_flat = k_cum_means.view(B, H, padded_L_k, D_h)
+        v_cum_flat = v_cum_means.view(B, H, padded_L_k, D_h)
+        
+        k_current_diag = k_cum_flat[:, :, offset:offset+L_q, :]
+        v_current_diag = v_cum_flat[:, :, offset:offset+L_q, :]
+        
+        # --- Apply RoPE AFTER computing block means ---
+        # Apply RoPE to q and k_current_diag using the query frequencies
+        q_rope, k_current_diag_rope = apply_rotary_emb(q, k_current_diag, freqs_cis_q)
+        
+        # Apply RoPE to k_block_means using the block base frequencies
+        # We pass q_dummy just to satisfy the function signature
+        q_dummy = torch.zeros(B, H, M, D_h, device=q.device)
+        _, k_block_means_rope = apply_rotary_emb(q_dummy, k_block_means, freqs_cis_k_blocks)
 
-        # 4. Apply mask, softmax, and compute output
-        att = att.masked_fill(~active_mask, float('-inf'))
-        att = F.softmax(att, dim=-1)
+        # --- Vectorized Logit Calculation ---
+        logits_past = torch.matmul(q_rope, k_block_means_rope.transpose(-1, -2)) * self.scale # (B, H, L_q, M)
+        logits_current = (q_rope * k_current_diag_rope).sum(dim=-1) * self.scale # (B, H, L_q)
         
-        out = att @ v # (B, H, L_q, D_h)
+        # --- Create Absolute Masks ---
+        q_abs_idx = torch.arange(offset, offset + L_q, device=q.device).unsqueeze(1) # (L_q, 1)
+        b_idx = torch.arange(M, device=q.device).unsqueeze(0) # (1, M)
+        
+        current_mask = (q_abs_idx // self.signal_window) == b_idx # (L_q, M)
+        future_mask = b_idx > (q_abs_idx // self.signal_window)   # (L_q, M)
+        
+        # Patch logits
+        logits = torch.where(current_mask.unsqueeze(0).unsqueeze(0), logits_current.unsqueeze(-1), logits_past)
+        logits.masked_fill_(future_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        
+        attn = F.softmax(logits, dim=-1)
+        
+        # --- Vectorized Value Calculation ---
+        out_past = torch.matmul(attn, v_block_means) # (B, H, L_q, D_h)
+        
+        prob_current = (attn * current_mask.unsqueeze(0).unsqueeze(0)).sum(dim=-1, keepdim=True) # (B, H, L_q, 1)
+        
+        # Gather the specific block mean for each query to subtract it
+        block_indices = (q_abs_idx // self.signal_window).view(-1) # (L_q,)
+        v_block_means_gathered = v_block_means[:, :, block_indices, :] # (B, H, L_q, D_h)
+        
+        incorrect_contribution = prob_current * v_block_means_gathered
+        
+        # Subtract incorrect block mean, add correct cumulative mean
+        out = out_past - incorrect_contribution + (prob_current * v_current_diag)
+        
         return out
 
 # =============================================================================
@@ -297,8 +321,8 @@ class SSMAttentionBlock(nn.Module):
         self.q_norm = nn.LayerNorm(self.head_dim)
         self.k_norm = nn.LayerNorm(self.head_dim)
         
-        # NEW: LSH Retrieval Attention module
-        self.lsh_attn = LSHRetrievalAttention(dim, num_heads, local_window_size=128, num_hash_bits=4)
+        # NEW: Bayesian Signal Attention module
+        self.bayesian_attn = BayesianSignalAttention(dim, num_heads, signal_window=2)
         
         self.attn_dropout = nn.Dropout(dropout)
 
@@ -339,7 +363,7 @@ class SSMAttentionBlock(nn.Module):
         # Frequencies for the current query
         freqs_cis_q = freqs_cis_ext[abs_pos_offset : abs_pos_offset + L]
         
-        # Apply RoPE to current queries and keys
+        # We only apply RoPE here to compute proxy scores for saliency eviction
         q_rope, k_rope = apply_rotary_emb(q, k, freqs_cis_q)
 
         # We store the UNROTATED k and v, AND the ROTATED k_rope in the cache
@@ -377,8 +401,18 @@ class SSMAttentionBlock(nn.Module):
         else:
             new_kv = None
 
-        # Call LSH Retrieval Attention with fully rotated queries and keys
-        attn_out = self.lsh_attn(q_rope, k_rope_full, v_full)
+        # Determine block base frequencies for BayesianSignalAttention
+        padded_L_k = k_full.size(2)
+        pad_len = (self.bayesian_attn.signal_window - (padded_L_k % self.bayesian_attn.signal_window)) % self.bayesian_attn.signal_window
+        total_L_k = padded_L_k + pad_len
+        M = total_L_k // self.bayesian_attn.signal_window
+        
+        # The base position for block m is m * signal_window
+        block_base_positions = torch.arange(0, M * self.bayesian_attn.signal_window, self.bayesian_attn.signal_window, device=x.device)
+        freqs_cis_k_blocks = freqs_cis_ext[block_base_positions]
+
+        # REPLACED: Pass unrotated q and k_full. RoPE is applied internally after block means.
+        attn_out = self.bayesian_attn(q, k_full, v_full, freqs_cis_q, freqs_cis_k_blocks)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
         x = x + self.attn_dropout(self.wo(attn_out))
