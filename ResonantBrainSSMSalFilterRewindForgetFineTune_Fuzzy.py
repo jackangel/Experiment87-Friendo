@@ -11,6 +11,15 @@ import json
 from datetime import datetime
 from typing import Optional, Tuple, List
 
+# Optional: for streaming large JSON files
+try:
+    import ijson
+    HAS_IJSON = True
+except ImportError:
+    HAS_IJSON = False
+    print("[INFO] ijson not installed. Large JSON files will be loaded entirely into memory.")
+    print("[INFO] Install with: pip install ijson")
+
 # ==========================================
 # 0. TIKTOKEN TOKENIZER & CHATML CONSTANTS
 # ==========================================
@@ -89,12 +98,14 @@ class FFTCausalConv(nn.Module):
 
     def forward(self, x, carry_state=None):
         B, L, D = x.shape
+        input_dtype = x.dtype
         x_t = x.transpose(1, 2).contiguous()
 
         h, alpha = self._build_decay_filter(L, x.device)
 
-        x_padded = F.pad(x_t, (0, L))
-        h_padded = F.pad(h, (0, L))
+        # Cast to float32 for FFT operations (FFT doesn't support bfloat16)
+        x_padded = F.pad(x_t, (0, L)).float()
+        h_padded = F.pad(h, (0, L)).float()
         X_freq = torch.fft.rfft(x_padded, n=2 * L)
         H_freq = torch.fft.rfft(h_padded, n=2 * L)
         y = torch.fft.irfft(X_freq * H_freq, n=2 * L)[..., :L]
@@ -105,11 +116,15 @@ class FFTCausalConv(nn.Module):
         y = y / h_norm
 
         if carry_state is not None:
+            carry_state_f32 = carry_state.float() if carry_state.dtype != torch.float32 else carry_state
             t_pos = torch.arange(L, device=x.device, dtype=torch.float32).unsqueeze(0)
             carry_decay = torch.exp(-alpha.unsqueeze(1) * (t_pos + 1))
-            y = y + carry_state.unsqueeze(2) * carry_decay.unsqueeze(0)
+            y = y + carry_state_f32.unsqueeze(2) * carry_decay.unsqueeze(0)
 
         new_carry = y[:, :, -1].clone()
+        # Cast back to original dtype
+        y = y.to(input_dtype)
+        new_carry = new_carry.to(input_dtype)
         return y.transpose(1, 2).contiguous(), new_carry
 
 # =============================================================================
@@ -299,13 +314,14 @@ class BayesianSignalAttention(nn.Module):
 
 class SSMAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads, max_seq_len, num_layers, dropout=0.1, 
-                 forgetting_config=None, use_eviction=True):
+                 forgetting_config=None, use_eviction=True, saliency_decay=0.95):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.max_seq_len = max_seq_len
         self.use_eviction = use_eviction
+        self.saliency_decay = saliency_decay  # Configurable decay factor
 
         self.norm_ssm = nn.LayerNorm(dim)
         self.fft_conv = FFTCausalConv(dim, max_seq_len)
@@ -374,19 +390,23 @@ class SSMAttentionBlock(nn.Module):
             k_rope_full = k_rope
             past_scores = torch.zeros((B, 0), device=x.device)
 
-        with torch.no_grad():
-            q_proxy = q_rope[:, 0, :, :]
-            k_proxy = k_rope_full[:, 0, :, :]
-            proxy_scores = torch.matmul(q_proxy, k_proxy.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if L > 1:
-                mask = torch.triu(torch.ones(L, k_proxy.size(1), device=x.device), diagonal=k_proxy.size(1) - L + 1).bool()
-                proxy_scores.masked_fill_(mask, float('-inf'))
-            proxy_weights = F.softmax(proxy_scores, dim=-1)
-            current_saliency = proxy_weights.sum(dim=1)
+        # Only compute saliency if we need it for eviction or caching
+        if use_cache and self.use_eviction:
+            with torch.no_grad():
+                q_proxy = q_rope[:, 0, :, :]
+                k_proxy = k_rope_full[:, 0, :, :]
+                proxy_scores = torch.matmul(q_proxy, k_proxy.transpose(-2, -1)) / math.sqrt(self.head_dim)
+                if L > 1:
+                    mask = torch.triu(torch.ones(L, k_proxy.size(1), device=x.device), diagonal=k_proxy.size(1) - L + 1).bool()
+                    proxy_scores.masked_fill_(mask, float('-inf'))
+                proxy_weights = F.softmax(proxy_scores, dim=-1)
+                current_saliency = proxy_weights.sum(dim=1)
 
-        decay_factor = 0.9
-        updated_scores = torch.cat([past_scores * decay_factor, torch.zeros((B, L), device=x.device)], dim=1)
-        updated_scores += current_saliency
+            updated_scores = torch.cat([past_scores * self.saliency_decay, torch.zeros((B, L), device=x.device)], dim=1)
+            updated_scores += current_saliency
+        else:
+            # Skip saliency computation when not needed (training or no eviction)
+            updated_scores = torch.cat([past_scores, torch.zeros((B, L), device=x.device)], dim=1)
 
         if use_cache:
             if self.use_eviction:
@@ -405,7 +425,26 @@ class SSMAttentionBlock(nn.Module):
         block_base_positions = torch.arange(0, M * self.bayesian_attn.signal_window, self.bayesian_attn.signal_window, device=x.device)
         freqs_cis_k_blocks = freqs_cis_ext[block_base_positions]
 
-        attn_out = self.bayesian_attn(q, k_full, v_full, freqs_cis_q, freqs_cis_k_blocks)
+        # Try to use Flash Attention if available for speedup
+        use_flash = hasattr(F, 'scaled_dot_product_attention') and k_full.size(2) <= 8192
+        
+        if use_flash:
+            # Flash Attention path (3-5x faster)
+            # Need to handle causal masking for cached KV
+            attn_mask = None
+            if k_full.size(2) > L:
+                # We have cached KV, so we need to allow attention to all past tokens
+                attn_mask = torch.zeros((L, k_full.size(2)), dtype=torch.bool, device=x.device)
+            
+            attn_out = F.scaled_dot_product_attention(
+                q_rope, k_rope_full, v_full,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=(attn_mask is None)
+            )
+        else:
+            # Bayesian Signal Attention path (custom implementation)
+            attn_out = self.bayesian_attn(q, k_full, v_full, freqs_cis_q, freqs_cis_k_blocks)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
         x = x + self.attn_dropout(self.wo(attn_out))
@@ -442,12 +481,13 @@ def get_forgetting_config(layer_idx, num_layers, enable_forgetting):
 
 class SSMTransformer(nn.Module):
     def __init__(self, vocab_size, dim, num_heads, num_layers, max_seq_len=512, 
-                 dropout=0.1, enable_forgetting=False):
+                 dropout=0.1, enable_forgetting=False, saliency_decay=0.95):
         super().__init__()
         self.dim = dim
         self.num_layers = num_layers
         self.max_seq_len = max_seq_len
         self.head_dim = dim // num_heads
+        self.saliency_decay = saliency_decay
 
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=0.02)
@@ -457,7 +497,8 @@ class SSMTransformer(nn.Module):
             SSMAttentionBlock(
                 dim, num_heads, max_seq_len, num_layers, dropout,
                 forgetting_config=get_forgetting_config(i, num_layers, enable_forgetting),
-                use_eviction=(i >= 1) 
+                use_eviction=(i >= 1),
+                saliency_decay=saliency_decay
             )
             for i in range(num_layers)
         ])
@@ -543,16 +584,32 @@ def token_generator_from_parquet(files, text_column, tokenizer):
                 for text in df[text_column].dropna():
                     yield from tokenizer.encode(str(text))
         except Exception as e:
-            pass
+            print(f"[WARNING] Failed to read parquet file {file}: {e}")
+            continue
 
 # --- Stream 2: OpenHermes JSON / ChatML format (Fine-Tuning) ---
-def stream_chatml_from_json(json_file, tokenizer, seq_len, device, batch_size=4):
-    print(f"\n[Dataset] Loading huge JSON dataset from {json_file}. This might take a minute...")
-    with open(json_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    print(f"[Dataset] Successfully loaded {len(data)} conversations. Generating ChatML masks...\n")
-    
-    random.shuffle(data)
+def stream_chatml_from_json(json_file, tokenizer, seq_len, device, batch_size=4, use_streaming=True):
+    """
+    Stream ChatML data from JSON file.
+    If use_streaming=True and ijson available, uses streaming (memory efficient for large files).
+    If use_streaming=False, loads entire file (faster but uses more RAM).
+    """
+    if use_streaming and HAS_IJSON:
+        # Memory-efficient streaming mode for huge datasets
+        print(f"\n[Dataset] Streaming JSON dataset from {json_file} (memory-efficient mode)...\n")
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data_stream = ijson.items(f, 'item')
+    else:
+        # Original mode: load entire file
+        if use_streaming and not HAS_IJSON:
+            print(f"[WARNING] ijson not available, falling back to loading entire file.")
+        print(f"\n[Dataset] Loading entire JSON dataset from {json_file}. This might take a minute...")
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        print(f"[Dataset] Successfully loaded {len(data)} conversations. Generating ChatML masks...\n")
+        
+        random.shuffle(data)
+        data_stream = iter(data)
     
     buffer_ids = []
     buffer_mask = []
@@ -562,7 +619,7 @@ def stream_chatml_from_json(json_file, tokenizer, seq_len, device, batch_size=4)
     
     role_map = {"system": "system", "human": "user", "gpt": "assistant"}
     
-    for item in data:
+    for item in data_stream:
         conversations = item.get("conversations", [])
         if not conversations:
             continue
@@ -611,25 +668,45 @@ def stream_chatml_from_json(json_file, tokenizer, seq_len, device, batch_size=4)
 # =============================================================================
 
 class CognitiveMemoryManager:
-    def __init__(self, device):
+    def __init__(self, device, max_paragraphs=50):
         self.device = device
+        self.max_paragraphs = max_paragraphs  # Prevent unbounded growth
         self.paragraph_states = []
         self.paragraph_tokens = []
 
     def save_paragraph_state(self, carry_states, past_key_values, tokens):
-        cpu_carry = [c.detach().cpu().clone() if c is not None else None for c in carry_states] if carry_states else None
-        cpu_kv = []
-        if past_key_values:
-            for k, v, s, kr in past_key_values:
-                cpu_kv.append((k.detach().cpu().clone(), v.detach().cpu().clone(), s.detach().cpu().clone(), kr.detach().cpu().clone()))
+        # Keep states on GPU to avoid CPU-GPU transfers (much faster)
+        # Only move to CPU if approaching max_paragraphs limit
+        should_cpu = len(self.paragraph_states) >= self.max_paragraphs * 0.8
+        
+        if should_cpu:
+            cpu_carry = [c.detach().cpu().clone() if c is not None else None for c in carry_states] if carry_states else None
+            cpu_kv = []
+            if past_key_values:
+                for k, v, s, kr in past_key_values:
+                    cpu_kv.append((k.detach().cpu().clone(), v.detach().cpu().clone(), s.detach().cpu().clone(), kr.detach().cpu().clone()))
+            else:
+                cpu_kv = None
         else:
-            cpu_kv = None
+            # Keep on GPU for faster access
+            cpu_carry = [c.detach().clone() if c is not None else None for c in carry_states] if carry_states else None
+            cpu_kv = []
+            if past_key_values:
+                for k, v, s, kr in past_key_values:
+                    cpu_kv.append((k.detach().clone(), v.detach().clone(), s.detach().clone(), kr.detach().clone()))
+            else:
+                cpu_kv = None
             
         self.paragraph_states.append({
             'carry_states': cpu_carry,
             'past_key_values': cpu_kv
         })
         self.paragraph_tokens.append(tokens)
+        
+        # Enforce max paragraphs limit (keep most recent)
+        if len(self.paragraph_states) > self.max_paragraphs:
+            self.paragraph_states = self.paragraph_states[-self.max_paragraphs:]
+            self.paragraph_tokens = self.paragraph_tokens[-self.max_paragraphs:]
 
     def get_paragraph_state(self, idx):
         snap = self.paragraph_states[idx]
@@ -650,68 +727,82 @@ def generate_block_recurrent(model, context_ids, tokenizer, device,
                              max_new_tokens=256, chunk_size=512,
                              temperature=0.8, repetition_penalty=1.2,
                              top_k=50, top_p=0.9, enable_rewind=True,
-                             stop_sequence=None):
+                             stop_sequence=None, max_paragraph_cache=50):
     model.eval()
-    memory_manager = CognitiveMemoryManager(device)
+    memory_manager = CognitiveMemoryManager(device, max_paragraphs=max_paragraph_cache)
 
     with torch.inference_mode():
         generated_ids = context_ids.copy()
         
         paragraphs = [context_ids[i:i + chunk_size] for i in range(0, len(context_ids), chunk_size)]
         
+        # Process context chunks with proper position tracking
+        carry_states = None
+        past_key_values = None
+        cumulative_pos = 0
         for chunk in paragraphs:
             if len(chunk) == 0: 
                 continue
             chunk_tensor = torch.tensor(chunk, dtype=torch.long).unsqueeze(0).to(device)
             _, carry_states, past_key_values = model(
-                x=chunk_tensor, carry_states=None, is_training=False, 
-                past_key_values=None, use_cache=True, abs_pos_offset=0
+                x=chunk_tensor, carry_states=carry_states, is_training=False, 
+                past_key_values=past_key_values, use_cache=True, abs_pos_offset=cumulative_pos
             )
+            cumulative_pos += len(chunk)
             memory_manager.save_paragraph_state(carry_states, past_key_values, chunk)
 
         tokens_generated = 0
+        context_length = len(generated_ids)  # Track where new generation starts
+        
+        # Initialize with the last paragraph state and correct position
+        if len(memory_manager.paragraph_tokens) > 0:
+            active_carry, active_kv = memory_manager.get_paragraph_state(len(paragraphs) - 1)
+            abs_pos_offset = cumulative_pos
+        else:
+            active_carry, active_kv = None, None
+            abs_pos_offset = 0
         
         while tokens_generated < max_new_tokens:
-            if enable_rewind and len(memory_manager.paragraph_tokens) > 0:
-                recent_tokens = set(generated_ids[-20:]) 
-                best_idx = 0
-                best_score = -1
-                for idx, p_tokens in enumerate(memory_manager.paragraph_tokens):
-                    score = len(recent_tokens.intersection(set(p_tokens)))
-                    if score > best_score:
-                        best_score = score
-                        best_idx = idx
-                        
-                active_carry, active_kv = memory_manager.get_paragraph_state(best_idx)
-                abs_pos_offset = len(memory_manager.paragraph_tokens[best_idx])
-            else:
-                best_idx = len(paragraphs) - 1
-                active_carry, active_kv = memory_manager.get_paragraph_state(best_idx)
-                abs_pos_offset = len(paragraphs[best_idx])
-
             last_token = torch.tensor([[generated_ids[-1]]], dtype=torch.long, device=device)
             logits, active_carry, active_kv = model(
                 x=last_token, carry_states=active_carry, is_training=False, 
                 past_key_values=active_kv, use_cache=True, abs_pos_offset=abs_pos_offset
             )
+            
+            # Increment position for next iteration
+            abs_pos_offset += 1
 
-            next_token_logits = logits[0, -1].clone()
+            # Convert to float32 for numerical stability during sampling
+            next_token_logits = logits[0, -1].float().clone()
             next_token_logits = apply_sampling_penalties(
                 next_token_logits, generated_ids, repetition_penalty=repetition_penalty, top_k=top_k, top_p=top_p
             )
             probs = F.softmax(next_token_logits / temperature, dim=-1)
             
-            next_token = tokenizer.tokenizer.eot_token if torch.isnan(probs).any() else torch.multinomial(probs, 1).item()
+            if torch.isnan(probs).any():
+                print(f"\n[ERROR] NaN detected in sampling probabilities at token {tokens_generated}!")
+                print(f"[ERROR] Last logits stats: min={next_token_logits.min():.2f}, max={next_token_logits.max():.2f}, mean={next_token_logits.mean():.2f}")
+                print(f"[ERROR] Temperature: {temperature}, Last token: {generated_ids[-1]}")
+                next_token = tokenizer.tokenizer.eot_token
+            else:
+                next_token = torch.multinomial(probs, 1).item()
+            
             generated_ids.append(next_token)
             tokens_generated += 1
             
-            if next_token == tokenizer.tokenizer.eot_token: 
+            #print(f"\n[DEBUG] Token {tokens_generated}: {next_token} -> '{tokenizer.decode([next_token])}'")
+            
+            if next_token == tokenizer.tokenizer.eot_token:
+                #print(f"[DEBUG] EOT token detected. Breaking. EOT={tokenizer.tokenizer.eot_token}")
                 break
             
             if stop_sequence:
-                check_len = min(len(generated_ids), 10)
-                recent_text = tokenizer.decode(generated_ids[-check_len:])
+                # Only check newly generated tokens, not the context
+                new_tokens_only = generated_ids[context_length:]
+                check_len = min(len(new_tokens_only), 10)
+                recent_text = tokenizer.decode(new_tokens_only[-check_len:])
                 if stop_sequence in recent_text:
+                    print(f"[DEBUG] Stop sequence '{stop_sequence}' found in '{recent_text}'. Breaking.")
                     break
 
     return generated_ids
@@ -746,6 +837,7 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
     
     print(f"\n--- Starting Pre-training (Parquet) | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
     print(f"--- Fuzzy Training Enabled: {fuzzy_steps} Fuzzy / {clear_steps} Clear | Bag Size: {bag_size} ---")
+    print(f"--- Flash Attention: {'Available' if hasattr(F, 'scaled_dot_product_attention') else 'Not Available'} ---")
     
     iteration = start_iteration
     random.shuffle(parquet_files)
@@ -846,7 +938,7 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
                 print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler, step_type)
                 running_train_loss = 0.0
 
-            if iteration % 2000 == 0:
+            if iteration % 20000 == 0:
                 model.eval()
                 print(f"\n{'='*60}\n[GENERATION SAMPLE (Pre-training Coherence)]\n{'='*60}")
                 test_prompt = "The rapid advancement of artificial intelligence has led to"
@@ -866,13 +958,14 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
 # --- 9B. Fine-tuning (Masked Instruction Tuning on ChatML JSON with Grad Accum) ---
 def run_finetuning(model, json_file, tokenizer, optimizer, device,
                    vocab_size, start_iteration=0, chunk_size=512, enable_forgetting=False, 
-                   batch_size=2, grad_accum_steps=4):
+                   batch_size=2, grad_accum_steps=4, use_streaming=True):
     
     print(f"\n--- Starting ChatML Fine-tuning (OpenHermes) | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
+    print(f"--- Flash Attention: {'Available' if hasattr(F, 'scaled_dot_product_attention') else 'Not Available'} ---")
     iteration = start_iteration
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0)
 
-    token_stream = stream_chatml_from_json(json_file, tokenizer, chunk_size, device, batch_size)
+    token_stream = stream_chatml_from_json(json_file, tokenizer, chunk_size, device, batch_size, use_streaming)
     
     ptdtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=(ptdtype == torch.float16))
@@ -979,7 +1072,7 @@ def chat_mode(model, tokenizer, device, chunk_size=512):
                 model, context_ids, tokenizer, device,
                 max_new_tokens=256, chunk_size=chunk_size,
                 temperature=0.7, repetition_penalty=1.15, top_k=20, top_p=0.95, 
-                enable_rewind=True, stop_sequence=CHAT_END
+                enable_rewind=True, stop_sequence=CHAT_END, max_paragraph_cache=50
             )
 
             response_text = tokenizer.decode(generated_ids[len(context_ids):])
@@ -1017,6 +1110,11 @@ if __name__ == "__main__":
     GRAD_ACCUM_STEPS = 4
     LEARNING_RATE = 4e-4
     
+    # Optimization Parameters
+    SALIENCY_DECAY = 0.95  # Configurable decay factor (was hardcoded to 0.9)
+    USE_JSON_STREAMING = True  # Memory-efficient streaming for large datasets
+    MAX_PARAGRAPH_CACHE = 50  # Limit paragraph states in generation
+    
     # Fuzzy Training Config
     FUZZY_STEPS = 1
     CLEAR_STEPS = 3
@@ -1032,7 +1130,8 @@ if __name__ == "__main__":
         num_heads=config['num_heads'],
         num_layers=config['num_layers'], 
         max_seq_len=CHUNK_SIZE,
-        enable_forgetting=ENABLE_COGNITIVE_FORGETTING
+        enable_forgetting=ENABLE_COGNITIVE_FORGETTING,
+        saliency_decay=SALIENCY_DECAY
     ).to(device)
     
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -1084,7 +1183,7 @@ if __name__ == "__main__":
         else:
             run_finetuning(
                 model, JSON_DATASET_PATH, tokenizer, optimizer, device, vocab_size, start_it, 
-                CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS
+                CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS, USE_JSON_STREAMING
             )
             
     elif choice == '3':
