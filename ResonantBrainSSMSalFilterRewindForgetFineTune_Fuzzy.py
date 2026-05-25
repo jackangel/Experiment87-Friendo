@@ -470,10 +470,10 @@ def get_forgetting_config(layer_idx, num_layers, enable_forgetting):
     depth_ratio = layer_idx / max(1, num_layers - 1)
     return {
         # Decreased from 0.980 to 0.950 (decays faster during grad accum steps)
-        'decay_factor': 0.950 + (depth_ratio * 0.018),      
+        'decay_factor': 0.975 + (depth_ratio * 0.018),      
         
         # Increased from 0.90 to 0.95 (requires higher sustained health to lock)
-        'lock_threshold': 0.95 + (depth_ratio * 0.04),      
+        'lock_threshold': 0.90 + (depth_ratio * 0.04),      
         
         'health_floor': 0.1 + (depth_ratio * 0.3),          
         'gated_fraction': 0.9 - (depth_ratio * 0.6),        
@@ -512,6 +512,18 @@ class SSMTransformer(nn.Module):
 
         freqs_cis_ext = precompute_freqs_cis(self.head_dim, max_seq_len * 8, max_train_len=max_seq_len)
         self.register_buffer("freqs_cis_ext", freqs_cis_ext)
+        
+        # Print forgetting configuration for each layer
+        if enable_forgetting:
+            print(f"\n{'='*60}")
+            print(f"Cognitive Forgetting Gate Configuration (Enabled)")
+            print(f"{'='*60}")
+            for i in range(num_layers):
+                config = get_forgetting_config(i, num_layers, enable_forgetting)
+                if config:
+                    print(f"Layer {i:2d}: decay={config['decay_factor']:.4f}, lock_thresh={config['lock_threshold']:.3f}, "
+                          f"health_floor={config['health_floor']:.2f}, gated_frac={config['gated_fraction']:.2f}")
+            print(f"{'='*60}\n")
 
     def forward(self, x=None, inputs_embeds=None, carry_states=None, is_training=True, past_key_values=None, use_cache=False, abs_pos_offset=0):
         # Support for inputs_embeds to enable Fuzzy Training
@@ -573,6 +585,34 @@ def validate_vocab_size(model, tokenizer):
     tokenizer_vocab = tokenizer.vocab_size
     if model_vocab != tokenizer_vocab:
         raise ValueError(f"CRITICAL: Model vocab_size ({model_vocab}) != Tokenizer vocab_size ({tokenizer_vocab}).")
+
+def load_checkpoint_with_filter(model, checkpoint_state_dict):
+    """
+    Load checkpoint while filtering out keys with size mismatches (e.g., forgetting gate buffers).
+    This allows resuming training after changing forgetting hyperparameters.
+    """
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped_keys = []
+    
+    for key, value in checkpoint_state_dict.items():
+        if key in model_state:
+            if value.shape == model_state[key].shape:
+                filtered_state[key] = value
+            else:
+                skipped_keys.append(f"{key} (ckpt: {value.shape}, model: {model_state[key].shape})")
+        else:
+            skipped_keys.append(f"{key} (not in current model)")
+    
+    if skipped_keys:
+        print(f"[INFO] Skipped {len(skipped_keys)} mismatched keys (forgetting gate buffers):")
+        for key in skipped_keys[:5]:  # Show first 5
+            print(f"  - {key}")
+        if len(skipped_keys) > 5:
+            print(f"  ... and {len(skipped_keys) - 5} more")
+    
+    model.load_state_dict(filtered_state, strict=False)
+    return len(skipped_keys)
 
 # --- Stream 1: Plain Text Parquet (Pre-training) - Flat Generator for Fuzzy Training ---
 def token_generator_from_parquet(files, text_column, tokenizer):
@@ -1153,9 +1193,10 @@ if __name__ == "__main__":
         start_it = 0
         if os.path.exists(ckpt_path) and input("Resume pre-training checkpoint? (y/n): ").strip().lower() == 'y':
             ckpt = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(ckpt['model_state_dict'])
+            load_checkpoint_with_filter(model, ckpt['model_state_dict'])
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             start_it = ckpt.get('iteration', 0)
+            print("[INFO] Loaded checkpoint (filtered mismatched keys)")
             
         run_pretraining(
             model, files, "text", tokenizer, optimizer, device, vocab_size, start_it, 
@@ -1169,14 +1210,15 @@ if __name__ == "__main__":
         if os.path.exists('checkpoint_ssm_pretrain.pth') and not os.path.exists(ckpt_path):
             if input("Load base pre-trained weights before fine-tuning? (y/n): ").strip().lower() == 'y':
                 ckpt = torch.load('checkpoint_ssm_pretrain.pth', map_location=device)
-                model.load_state_dict(ckpt['model_state_dict'])
+                load_checkpoint_with_filter(model, ckpt['model_state_dict'])
                 print("Pre-trained base weights loaded!")
 
         if os.path.exists(ckpt_path) and input("Resume existing fine-tuning checkpoint? (y/n): ").strip().lower() == 'y':
             ckpt = torch.load(ckpt_path, map_location=device)
-            model.load_state_dict(ckpt['model_state_dict'])
+            load_checkpoint_with_filter(model, ckpt['model_state_dict'])
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
             start_it = ckpt.get('iteration', 0)
+            print("[INFO] Loaded checkpoint (filtered mismatched keys)")
             
         if not os.path.exists(JSON_DATASET_PATH):
             print(f"ERROR: Cannot find JSON dataset at {JSON_DATASET_PATH}. Please update the script path.")
@@ -1197,7 +1239,7 @@ if __name__ == "__main__":
             print("No checkpoints found. Running with untrained random weights!")
             ckpt = {}
             
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
+        if 'model_state_dict' in ckpt: 
+            load_checkpoint_with_filter(model, ckpt['model_state_dict'])
             
         chat_mode(model, tokenizer, device, chunk_size=ckpt.get('chunk_size', CHUNK_SIZE))
