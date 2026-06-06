@@ -409,24 +409,26 @@ class SSMAttentionBlock(nn.Module):
     def forward(self, x, freqs_cis_ext, abs_pos_offset=0, carry_state=None, past_kv=None, use_cache=False):
         B, L, D = x.shape
         
-        # === MoD: Token Selection (only during training) ===
+        # === MoD: Token Selection (training AND inference for consistency) ===
         mod_router_logits = None
         mod_selected_mask = None
         
-        if self.enable_mod and self.training:
-            with torch.no_grad() if not self.training else torch.enable_grad():
+        if self.enable_mod:
+            if self.training:
                 router_scores = self.mod_router(x).squeeze(-1)  # (B, L)
                 mod_router_logits = router_scores  # Save for load balancing loss
-                
-                # Select top-k tokens per batch item
-                k = max(1, int(L * self.mod_top_k_ratio))
-                _, top_indices = torch.topk(router_scores, k, dim=-1)
-                
-                # Create selection mask
-                mod_selected_mask = torch.zeros(B, L, dtype=torch.bool, device=x.device)
-                mod_selected_mask.scatter_(1, top_indices, True)
-                
                 self.mod_step_count += 1
+            else:
+                with torch.no_grad():
+                    router_scores = self.mod_router(x).squeeze(-1)  # (B, L)
+            
+            # Select top-k tokens per batch item (same ratio for train and inference)
+            k = max(1, int(L * self.mod_top_k_ratio))
+            _, top_indices = torch.topk(router_scores, k, dim=-1)
+            
+            # Create selection mask
+            mod_selected_mask = torch.zeros(B, L, dtype=torch.bool, device=x.device)
+            mod_selected_mask.scatter_(1, top_indices, True)
 
         ssm_out, new_carry = self.fft_conv(self.norm_ssm(x), carry_state)
         x = x + self.ssm_dropout(ssm_out)
@@ -441,14 +443,10 @@ class SSMAttentionBlock(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         
-        # === GQA: Expand KV heads to match Q heads ===
-        if self.num_kv_heads < self.num_heads:
-            # Repeat each KV head num_q_groups times
-            k = k.repeat_interleave(self.num_q_groups, dim=1)
-            v = v.repeat_interleave(self.num_q_groups, dim=1)
-        
         freqs_cis_q = freqs_cis_ext[abs_pos_offset : abs_pos_offset + L]
         
+        # Apply RoPE to compact (num_kv_heads) keys BEFORE expansion.
+        # The KV cache stores the compact versions, saving num_q_groups× memory.
         q_rope, k_rope = apply_rotary_emb(q, k, freqs_cis_q)
 
         if past_kv is not None:
@@ -482,14 +480,27 @@ class SSMAttentionBlock(nn.Module):
 
         if use_cache:
             if self.use_eviction:
+                # max_capacity=4x allows ~4 chunks of cross-chunk KV context to accumulate
+                # before eviction, giving meaningful long-range attention within the position budget
+                # (freqs_cis_ext covers max_seq_len * 8 positions, so 4x fits safely)
                 k_full, v_full, k_rope_full, updated_scores = apply_saliency_eviction(
-                    k_full, v_full, k_rope_full, updated_scores, num_sinks=4, max_capacity=self.max_seq_len
+                    k_full, v_full, k_rope_full, updated_scores, num_sinks=4, max_capacity=self.max_seq_len * 4
                 )
             new_kv = (k_full, v_full, updated_scores, k_rope_full)
         else:
             new_kv = None
 
-        padded_L_k = k_full.size(2)
+        # === GQA: Expand KV heads to match Q heads only for attention (not stored in cache) ===
+        if self.num_kv_heads < self.num_heads:
+            k_attn = k_full.repeat_interleave(self.num_q_groups, dim=1)
+            v_attn = v_full.repeat_interleave(self.num_q_groups, dim=1)
+            k_rope_attn = k_rope_full.repeat_interleave(self.num_q_groups, dim=1)
+        else:
+            k_attn = k_full
+            v_attn = v_full
+            k_rope_attn = k_rope_full
+
+        padded_L_k = k_attn.size(2)
         pad_len = (self.bayesian_attn.signal_window - (padded_L_k % self.bayesian_attn.signal_window)) % self.bayesian_attn.signal_window
         total_L_k = padded_L_k + pad_len
         M = total_L_k // self.bayesian_attn.signal_window
@@ -497,46 +508,43 @@ class SSMAttentionBlock(nn.Module):
         block_base_positions = torch.arange(0, M * self.bayesian_attn.signal_window, self.bayesian_attn.signal_window, device=x.device)
         freqs_cis_k_blocks = freqs_cis_ext[block_base_positions]
 
-        # Try to use Flash Attention if available for speedup
-        use_flash = hasattr(F, 'scaled_dot_product_attention') and k_full.size(2) <= 8192
+        # Route attention:
+        # - Training (use_cache=False): use BayesianSignalAttention — the designed architecture
+        #   that applies hierarchical block-mean attention with correct RoPE handling.
+        # - Inference/generation (use_cache=True): use Flash Attention for speed.
+        #   Flash is safe here because generation is token-by-token with an explicit mask.
+        use_flash = use_cache and hasattr(F, 'scaled_dot_product_attention') and k_attn.size(2) <= 8192
         
         if use_flash:
-            # Flash Attention path (3-5x faster)
-            # Proper causal masking for KV cache:
-            # - If we have cached KV (k_full.size(2) > L), we're generating new tokens
-            #   that should attend to all past cached tokens + causally to new tokens
-            # - If no cache (k_full.size(2) == L), use standard causal masking
+            # Flash Attention path — inference only (3-5x faster for generation)
             attn_mask = None
             is_causal = True
             
-            if k_full.size(2) > L:
+            if k_attn.size(2) > L:
                 # We have cached KV - new queries can attend to all past + causally to themselves
-                # Create causal mask: (L_q, L_kv) where L_kv = cached_len + L_q
-                cached_len = k_full.size(2) - L
-                # New tokens can see all cached tokens (past) + causal within new tokens
-                attn_mask = torch.ones((L, k_full.size(2)), dtype=torch.bool, device=x.device)
-                # Allow attention to all cached positions
+                cached_len = k_attn.size(2) - L
+                attn_mask = torch.ones((L, k_attn.size(2)), dtype=torch.bool, device=x.device)
                 attn_mask[:, :cached_len] = False
-                # Apply causal mask to the new token positions
                 causal_mask = torch.triu(torch.ones((L, L), dtype=torch.bool, device=x.device), diagonal=1)
                 attn_mask[:, cached_len:] = causal_mask
-                is_causal = False  # We're using explicit mask
+                is_causal = False
             
             attn_out = F.scaled_dot_product_attention(
-                q_rope, k_rope_full, v_full,
+                q_rope, k_rope_attn, v_attn,
                 attn_mask=attn_mask,
-                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                dropout_p=0.0,
                 is_causal=is_causal
             )
         else:
-            # Bayesian Signal Attention path (custom implementation)
-            attn_out = self.bayesian_attn(q, k_full, v_full, freqs_cis_q, freqs_cis_k_blocks)
+            # BayesianSignalAttention path — used during training
+            # Applies RoPE internally with correct block-position encodings
+            attn_out = self.bayesian_attn(q, k_attn, v_attn, freqs_cis_q, freqs_cis_k_blocks)
 
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
         x = x + self.attn_dropout(self.wo(attn_out))
 
         # === MLP with optional MoD skipping ===
-        if self.enable_mod and self.training and mod_selected_mask is not None:
+        if self.enable_mod and mod_selected_mask is not None:
             # Only process selected tokens through MLP
             selected_indices = mod_selected_mask.nonzero(as_tuple=True)
             if len(selected_indices[0]) > 0:
@@ -1259,11 +1267,13 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
                     vocab_size, start_iteration=0, chunk_size=512, enable_forgetting=False, 
                     batch_size=4, grad_accum_steps=4, fuzzy_steps=1, clear_steps=3, bag_size=2,
                     thinking_loss_weight=0.0, domain_switch_interval=4,
+                    enable_cold_start=False, cold_start_interval=256,
                     lr_decay_steps=500000, lr_min=1e-6):
     
     print(f"\n--- Starting Pre-training (Parquet) | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
     print(f"--- Fuzzy Training Enabled: {fuzzy_steps} Fuzzy / {clear_steps} Clear | Bag Size: {bag_size} ---")
     print(f"--- Domain Switch Interval: {domain_switch_interval}x chunk_size ---")
+    print(f"--- Cold-Start Resets: {'Enabled' if enable_cold_start else 'Disabled'}" + (f" (every {cold_start_interval} iterations)" if enable_cold_start else "") + " ---")
     print(f"--- Flash Attention: {'Available' if hasattr(F, 'scaled_dot_product_attention') else 'Not Available'} ---")
     
     # Check if model is wrapped with thinking system
@@ -1295,9 +1305,17 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
     token_stream = stream_manager.generate_tokens(chunk_len=chunk_size, domain_switch_interval=domain_switch_interval)
     buffer = []
     
-    carry_states, past_key_values, abs_pos_offset = None, None, 0
+    # Batched states: model returns (B, D) tensors - batch dimension provides per-sequence independence
+    carry_states = None
+    past_key_values = None
+    abs_pos_offset = 0
     running_train_loss, train_steps = 0.0, 0
     active_dataset = None
+    fuzzy_count_window = 0
+    clear_count_window = 0
+    pending_switch = False
+    switch_token = None
+    switch_dataset = None
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -1307,7 +1325,10 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
         required_len = (chunk_size + 1) * bag_size if is_fuzzy_step else chunk_size + 1
         advance_len = chunk_size * bag_size if is_fuzzy_step else chunk_size
         
+        # Build domain-homogeneous batch
         batch_chunks = []
+        pending_switch = False
+        dataset_exhausted = False
         while len(batch_chunks) < batch_size:
             if len(buffer) >= required_len:
                 batch_chunks.append(buffer[:required_len])
@@ -1315,41 +1336,82 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
             else:
                 try:
                     token, new_dataset = next(token_stream)
+                    
                     if active_dataset is not None and new_dataset != active_dataset:
-                        # Domain boundary: discard any partial batch already collected,
-                        # flush the buffer, and reset all recurrent states so the new
-                        # domain always starts with a clean slate. This prevents
-                        # mixed-domain carry_states from bleeding into the next batch.
-                        batch_chunks = []
-                        buffer = []
-                        carry_states, past_key_values, abs_pos_offset = None, None, 0
+                        # Domain switch detected - never mix domains in a batch
+                        pending_switch = True
+                        switch_token = token
+                        switch_dataset = new_dataset
+                        
+                        # Log the domain switch
+                        if running_train_loss > 0:
+                            progress_info = stream_manager.get_progress_info(active_dataset) if active_dataset else None
+                            if progress_info:
+                                progress_info['file_name'] = f"[{active_dataset}→{new_dataset}] {progress_info['file_name']}"
+                            print_gate_stats(model, iteration, running_train_loss, train_steps, scheduler, "SWITCH", progress_info)
+                        
+                        # Process partial batch first, then reset
+                        break
                     
                     active_dataset = new_dataset
                     buffer.append(token)
                 except StopIteration:
+                    dataset_exhausted = True
                     break
+        
+        # If empty batch after switch, reset and continue
+        if len(batch_chunks) == 0:
+            if pending_switch:
+                buffer = [switch_token]
+                carry_states = None
+                past_key_values = None
+                abs_pos_offset = 0
+                running_train_loss = 0.0
+                train_steps = 0
+                active_dataset = switch_dataset
+                pending_switch = False
+                # CRITICAL: flush any gradients accumulated in the current window from
+                # the old domain so they cannot contaminate the new domain's first
+                # optimizer step.
+                optimizer.zero_grad(set_to_none=True)
+            continue
                     
-        if len(batch_chunks) < batch_size:
+        # Only stop if dataset truly exhausted (not just partial batch from domain switch)
+        if len(batch_chunks) < batch_size and dataset_exhausted:
             print("Dataset exhausted.")
             break 
             
+        # Get actual batch size (may be partial on domain switch)
+        actual_batch_size = len(batch_chunks)
         chunk = torch.tensor(batch_chunks, dtype=torch.long, device=device)
 
-        if abs_pos_offset + chunk_size > base_model.freqs_cis_ext.size(0):
-            carry_states, past_key_values, abs_pos_offset = None, None, 0
+        # If partial batch (from domain switch), reset states to avoid shape mismatch
+        # Partial batches only occur at domain boundaries, so this is semantically correct
+        if actual_batch_size < batch_size:
+            carry_states = None
+            past_key_values = None
+            abs_pos_offset = 0
 
+        # Check position overflow and reset if needed
+        if abs_pos_offset + chunk_size > base_model.freqs_cis_ext.size(0):
+            carry_states = None
+            past_key_values = None
+            abs_pos_offset = 0
+
+        # Detach states for current step (after all reset conditions)
         detached_carry = [c.detach() for c in carry_states] if carry_states else None
         detached_kv = [(k.detach(), v.detach(), s.detach(), kr.detach()) for k, v, s, kr in past_key_values] if past_key_values else None
 
+        # Single batched forward pass - model handles per-sequence states via batch dimension
         with torch.autocast(device_type=device, dtype=ptdtype):
             if is_fuzzy_step:
                 inputs_flat = chunk[:, :-bag_size]
                 targets_flat = chunk[:, bag_size:]
                 
                 embs = base_model.tok_embeddings(inputs_flat)
-                embs = embs.view(batch_size, chunk_size, bag_size, -1).mean(dim=2)
+                embs = embs.view(actual_batch_size, chunk_size, bag_size, -1).mean(dim=2)
                 
-                y_bags = targets_flat.view(batch_size, chunk_size, bag_size)
+                y_bags = targets_flat.view(actual_batch_size, chunk_size, bag_size)
                 
                 logits, carry_states, past_key_values, mod_lb_loss = model(
                     inputs_embeds=embs, carry_states=detached_carry, past_key_values=detached_kv, 
@@ -1363,6 +1425,7 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
                     -1, y_bags, torch.ones_like(y_bags, dtype=logits.dtype) / bag_size
                 )
                 
+                # F.cross_entropy supports soft targets in PyTorch >= 1.10
                 loss = F.cross_entropy(logits.view(-1, actual_vocab_size), soft_targets.view(-1, actual_vocab_size))
                 if mod_lb_loss is not None:
                     loss = loss + mod_lb_loss
@@ -1383,8 +1446,6 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
             
             # Add thinking loss if model is wrapped
             if is_thinking_wrapper and thinking_loss_weight > 0:
-                # Get hidden state for thinking loss
-                # Note: We need gradients to flow, so don't use no_grad here
                 if is_fuzzy_step:
                     hidden_state = base_model.norm(embs)
                 else:
@@ -1399,6 +1460,25 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
         
         scaler.scale(loss).backward()
         
+        # If domain switch pending, reset states AFTER processing this batch
+        if pending_switch:
+            carry_states = None
+            past_key_values = None
+            abs_pos_offset = 0
+            running_train_loss = 0.0
+            train_steps = 0
+            active_dataset = switch_dataset
+            buffer = [switch_token]
+            pending_switch = False
+            # CRITICAL: discard the boundary batch's gradient AND any old-domain
+            # gradients still sitting in the accumulation buffer.  Without this,
+            # train_steps restarts at 0 while the parameter .grad tensors still
+            # hold (up to grad_accum_steps-1) old-domain contributions, polluting
+            # the first optimizer step of the new domain with cross-domain signal.
+            optimizer.zero_grad(set_to_none=True)
+            # Skip adding this boundary batch's loss to the new domain's window.
+            continue
+        
         running_train_loss += loss.item() * grad_accum_steps
         train_steps += 1
         
@@ -1412,17 +1492,36 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
             
             iteration += 1
 
+            if is_fuzzy_step:
+                fuzzy_count_window += 1
+            else:
+                clear_count_window += 1
+
+            # Periodic cold-start reset: forces the model to learn to generate from a cold
+            # carry state, which is the actual condition at inference time.
+            # This helps match training context length to inference context length.
+            # Can be disabled to maximize long-context accumulation during training.
+            if enable_cold_start and (iteration % cold_start_interval == 0):
+                carry_states = None
+                past_key_values = None
+                abs_pos_offset = 0
+
             if iteration % 100 == 0:
-                step_type = "FUZZY" if is_fuzzy_step else "CLEAR"
+                total_window = fuzzy_count_window + clear_count_window
+                step_type = f"F:{fuzzy_count_window}/C:{clear_count_window}" if total_window > 0 else "CLEAR"
+                fuzzy_count_window = 0
+                clear_count_window = 0
                 progress_info = stream_manager.get_progress_info(active_dataset) if active_dataset else None
                 if progress_info and active_dataset:
                     progress_info['file_name'] = f"[{active_dataset}] {progress_info['file_name']}"
                 print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler, step_type, progress_info)
                 running_train_loss = 0.0
+                train_steps = 0 
 
-            if iteration % 10000 == 0:
+            # Generate prediction every 1000 steps
+            if iteration % 1000 == 0:
                 model.eval()
-                print(f"\n{'='*60}\n[GENERATION SAMPLE (Pre-training Coherence)]\n{'='*60}")
+                print(f"\n{'='*60}\n[GENERATION SAMPLE (Pre-training Coherence) - Step {iteration}]\n{'='*60}")
                 test_prompt = "The rapid advancement of artificial intelligence has led to"
                 # Use base model for generation test
                 test_model = base_model if is_thinking_wrapper else model
@@ -1432,12 +1531,16 @@ def run_pretraining(model, dataset_config, text_column, tokenizer, optimizer, de
                 )
                 print(f"{tokenizer.decode(gen_ids)}\n")
                 model.train()
-
+            
+            # Save checkpoint every 10000 steps
+            if iteration % 10000 == 0:
+                print(f"\n[CHECKPOINT] Saving model at iteration {iteration}...")
                 torch.save({
                     'model_state_dict': model.state_dict(), 
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iteration': iteration, 'chunk_size': chunk_size,
                 }, 'checkpoint_ssm_pretrain.pth')
+                print(f"[CHECKPOINT] Saved to checkpoint_ssm_pretrain.pth\n")
 
 # --- 9B. Fine-tuning (Masked Instruction Tuning on ChatML JSON with Grad Accum) ---
 def run_finetuning(model, json_file, tokenizer, optimizer, device,
@@ -1521,9 +1624,10 @@ def run_finetuning(model, json_file, tokenizer, optimizer, device,
                 print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler, "CLEAR")
                 running_train_loss = 0.0
 
-            if iteration % 2000 == 0:
+            # Generate prediction every 1000 steps
+            if iteration % 1000 == 0:
                 model.eval()
-                print(f"\n{'='*60}\n[GENERATION SAMPLE (Instruction Following)]\n{'='*60}")
+                print(f"\n{'='*60}\n[GENERATION SAMPLE (Instruction Following) - Step {iteration}]\n{'='*60}")
                 test_prompt = f"{CHAT_START}user\nWhat is the purpose of AI fine-tuning?{CHAT_END}\n{CHAT_START}assistant\n"
                 # Use base model for generation test
                 test_model = base_model if is_thinking_wrapper else model
@@ -1533,12 +1637,16 @@ def run_finetuning(model, json_file, tokenizer, optimizer, device,
                 )
                 print(f"{tokenizer.decode(gen_ids)}\n")
                 model.train()
-
+            
+            # Save checkpoint every 10000 steps
+            if iteration % 10000 == 0:
+                print(f"\n[CHECKPOINT] Saving model at iteration {iteration}...")
                 torch.save({
                     'model_state_dict': model.state_dict(), 
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iteration': iteration, 'chunk_size': chunk_size,
                 }, 'checkpoint_ssm_finetune.pth')
+                print(f"[CHECKPOINT] Saved to checkpoint_ssm_finetune.pth\n")
 
 # =============================================================================
 # 9.5. MEMORY-AUGMENTED GENERATION
@@ -2467,7 +2575,10 @@ if __name__ == "__main__":
     LEARNING_RATE = 1e-4       # Reduced for continued pretraining at 290K+ steps
     LR_MIN = 1e-6              # Cosine decay floor
     LR_DECAY_STEPS = 500000    # Total steps for full cosine cycle (adjust to your training budget)
-    DOMAIN_SWITCH_INTERVAL = 64  # Number of full chunks to read from a single dataset before switching
+    # Chunks per domain burst. 1 opt-step = grad_accum * batch_size * chunk_size tokens
+    # = 4 * 2 * 1024 = 8192 tokens.  interval=8 → only 1 opt-step/domain (too few).
+    # interval=128 → ~16 opt-steps/domain (~131K tokens) — balanced diversity vs. convergence.
+    DOMAIN_SWITCH_INTERVAL = 128
     
     # Optimization Parameters
     SALIENCY_DECAY = 0.95  # Configurable decay factor (was hardcoded to 0.9)
