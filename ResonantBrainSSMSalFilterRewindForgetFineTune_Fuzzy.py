@@ -314,7 +314,7 @@ class BayesianSignalAttention(nn.Module):
 
 class SSMAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads, max_seq_len, num_layers, dropout=0.1, 
-                 forgetting_config=None, use_eviction=True, saliency_decay=0.95):
+                 forgetting_config=None, use_eviction=True, saliency_decay=0.95, use_flash_attn=False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -322,6 +322,7 @@ class SSMAttentionBlock(nn.Module):
         self.max_seq_len = max_seq_len
         self.use_eviction = use_eviction
         self.saliency_decay = saliency_decay  # Configurable decay factor
+        self.use_flash_attn = use_flash_attn  # Control Flash vs Bayesian attention
 
         self.norm_ssm = nn.LayerNorm(dim)
         self.fft_conv = FFTCausalConv(dim, max_seq_len)
@@ -425,8 +426,8 @@ class SSMAttentionBlock(nn.Module):
         block_base_positions = torch.arange(0, M * self.bayesian_attn.signal_window, self.bayesian_attn.signal_window, device=x.device)
         freqs_cis_k_blocks = freqs_cis_ext[block_base_positions]
 
-        # Try to use Flash Attention if available for speedup
-        use_flash = hasattr(F, 'scaled_dot_product_attention') and k_full.size(2) <= 8192
+        # Use Flash Attention if enabled and available
+        use_flash = self.use_flash_attn and hasattr(F, 'scaled_dot_product_attention') and k_full.size(2) <= 8192
         
         if use_flash:
             # Flash Attention path (3-5x faster)
@@ -481,13 +482,14 @@ def get_forgetting_config(layer_idx, num_layers, enable_forgetting):
 
 class SSMTransformer(nn.Module):
     def __init__(self, vocab_size, dim, num_heads, num_layers, max_seq_len=512, 
-                 dropout=0.1, enable_forgetting=False, saliency_decay=0.95):
+                 dropout=0.1, enable_forgetting=False, saliency_decay=0.95, use_flash_attn=False):
         super().__init__()
         self.dim = dim
         self.num_layers = num_layers
         self.max_seq_len = max_seq_len
         self.head_dim = dim // num_heads
         self.saliency_decay = saliency_decay
+        self.use_flash_attn = use_flash_attn
 
         self.tok_embeddings = nn.Embedding(vocab_size, dim)
         nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=0.02)
@@ -498,7 +500,8 @@ class SSMTransformer(nn.Module):
                 dim, num_heads, max_seq_len, num_layers, dropout,
                 forgetting_config=get_forgetting_config(i, num_layers, enable_forgetting),
                 use_eviction=(i >= 1),
-                saliency_decay=saliency_decay
+                saliency_decay=saliency_decay,
+                use_flash_attn=use_flash_attn
             )
             for i in range(num_layers)
         ])
@@ -704,6 +707,222 @@ def stream_chatml_from_json(json_file, tokenizer, seq_len, device, batch_size=4,
         )
 
 # =============================================================================
+# 6.5. DATASET MIXING FOR GENERAL LANGUAGE MODELS
+# =============================================================================
+
+class DatasetMixer:
+    """
+    Mixes multiple datasets according to specified weights for general language model training.
+    
+    Challenges addressed:
+    1. Weighted sampling across datasets
+    2. Different dataset formats (Parquet with different schemas)
+    3. Epoch boundaries (some datasets finish before others)
+    4. Memory efficiency (streaming from all datasets)
+    5. Resumability (can save/restore mixing state)
+    6. Temperature scaling to control over/under-sampling
+    """
+    
+    def __init__(self, dataset_config, tokenizer, text_column_map=None, temperature=1.0):
+        """
+        Args:
+            dataset_config: Dict of {name: {"path": str, "weight": float}}
+            tokenizer: Tokenizer instance
+            text_column_map: Dict mapping dataset name to column name (default: "text")
+            temperature: Temperature for weight scaling (lower = more uniform, higher = more skewed)
+        """
+        self.dataset_config = dataset_config
+        self.tokenizer = tokenizer
+        self.temperature = temperature
+        self.text_column_map = text_column_map or {}
+        
+        # Compute sampling probabilities with temperature scaling
+        weights = torch.tensor([cfg["weight"] for cfg in dataset_config.values()])
+        weights_temp = weights ** (1.0 / temperature)
+        self.sampling_probs = weights_temp / weights_temp.sum()
+        
+        self.dataset_names = list(dataset_config.keys())
+        self.token_generators = {}
+        self.tokens_sampled = {name: 0 for name in self.dataset_names}
+        self.batches_sampled = {name: 0 for name in self.dataset_names}
+        
+        print(f"\n{'='*60}")
+        print(f"Dataset Mixer Configuration (Temperature: {temperature})")
+        print(f"{'='*60}")
+        for name, prob in zip(self.dataset_names, self.sampling_probs):
+            original_weight = dataset_config[name]["weight"]
+            print(f"{name:15s}: Target={original_weight:.3f}, Sampling={prob:.3f}")
+        print(f"{'='*60}\n")
+    
+    def _get_text_column(self, dataset_name):
+        """Get the text column name for a dataset."""
+        return self.text_column_map.get(dataset_name, "text")
+    
+    def _init_generator(self, dataset_name):
+        """Initialize a token generator for a specific dataset."""
+        if dataset_name in self.token_generators:
+            return self.token_generators[dataset_name]
+        
+        config = self.dataset_config[dataset_name]
+        path = config["path"]
+        text_column = self._get_text_column(dataset_name)
+        
+        # Find all parquet files in the dataset directory
+        files = glob.glob(os.path.join(path, '**', '*.parquet'), recursive=True)
+        
+        if not files:
+            print(f"[WARNING] No parquet files found in {path}")
+            return None
+        
+        print(f"[Dataset Mixer] Loading {dataset_name}: {len(files)} files from {path}")
+        random.shuffle(files)
+        
+        # Create generator
+        generator = token_generator_from_parquet(files, text_column, self.tokenizer)
+        self.token_generators[dataset_name] = generator
+        return generator
+    
+    def mixed_token_stream(self, buffer_size=10000):
+        """
+        Generate a mixed stream of tokens from all datasets.
+        
+        Strategy: Maintain separate buffers for each dataset and sample from them.
+        This ensures we respect the sampling probabilities while maintaining efficiency.
+        
+        Args:
+            buffer_size: Number of tokens to buffer per dataset
+            
+        Yields:
+            tokens from the mixed dataset stream
+        """
+        # Initialize all generators
+        for name in self.dataset_names:
+            self._init_generator(name)
+        
+        # Maintain buffers for each dataset
+        buffers = {name: [] for name in self.dataset_names}
+        exhausted = set()
+        
+        while True:
+            # Fill buffers
+            for name in self.dataset_names:
+                if name in exhausted:
+                    continue
+                    
+                generator = self.token_generators.get(name)
+                if generator is None:
+                    exhausted.add(name)
+                    continue
+                
+                # Fill buffer to target size
+                while len(buffers[name]) < buffer_size:
+                    try:
+                        token = next(generator)
+                        buffers[name].append(token)
+                    except StopIteration:
+                        # Dataset exhausted, reinitialize for next epoch
+                        print(f"[Dataset Mixer] {name} epoch complete, restarting...")
+                        self._init_generator(name)
+                        break
+            
+            # Check if all datasets exhausted (shouldn't happen with reinitialization)
+            if len(exhausted) == len(self.dataset_names):
+                print("[Dataset Mixer] All datasets exhausted.")
+                break
+            
+            # Sample from buffers according to probabilities
+            available_datasets = [name for name in self.dataset_names 
+                                  if name not in exhausted and len(buffers[name]) > 0]
+            
+            if not available_datasets:
+                continue
+            
+            # Filter probabilities for available datasets
+            available_indices = [self.dataset_names.index(name) for name in available_datasets]
+            available_probs = self.sampling_probs[available_indices]
+            available_probs = available_probs / available_probs.sum()
+            
+            # Sample dataset
+            selected_idx = torch.multinomial(available_probs, 1).item()
+            selected_name = available_datasets[selected_idx]
+            
+            # Yield token
+            if buffers[selected_name]:
+                token = buffers[selected_name].pop(0)
+                self.tokens_sampled[selected_name] += 1
+                yield token
+    
+    def get_statistics(self):
+        """Return mixing statistics for monitoring."""
+        total_tokens = sum(self.tokens_sampled.values())
+        total_batches = sum(self.batches_sampled.values())
+        
+        stats = {
+            "total_tokens": total_tokens,
+            "total_batches": total_batches,
+            "per_dataset": {}
+        }
+        
+        for name in self.dataset_names:
+            tokens = self.tokens_sampled[name]
+            batches = self.batches_sampled[name]
+            target_weight = self.dataset_config[name]["weight"]
+            actual_weight = tokens / total_tokens if total_tokens > 0 else 0
+            
+            stats["per_dataset"][name] = {
+                "tokens": tokens,
+                "batches": batches,
+                "target_weight": target_weight,
+                "actual_weight": actual_weight,
+                "drift": actual_weight - target_weight
+            }
+        
+        return stats
+    
+    def print_statistics(self):
+        """Print mixing statistics in a readable format."""
+        stats = self.get_statistics()
+        
+        print(f"\n{'='*70}")
+        print(f"Dataset Mixing Statistics (Total Tokens: {stats['total_tokens']:,})")
+        print(f"{'='*70}")
+        print(f"{'Dataset':<15} {'Target':>8} {'Actual':>8} {'Drift':>8} {'Tokens':>12}")
+        print(f"{'-'*70}")
+        
+        for name, ds_stats in stats["per_dataset"].items():
+            print(f"{name:<15} {ds_stats['target_weight']:>7.1%} {ds_stats['actual_weight']:>7.1%} "
+                  f"{ds_stats['drift']:>+7.1%} {ds_stats['tokens']:>12,}")
+        
+        print(f"{'='*70}\n")
+
+def mixed_token_generator_from_datasets(dataset_config, tokenizer, text_column_map=None, temperature=1.0):
+    """
+    Convenience function to create a mixed token generator.
+    
+    Args:
+        dataset_config: Dict of {name: {"path": str, "weight": float}}
+        tokenizer: Tokenizer instance
+        text_column_map: Dict mapping dataset name to column name
+        temperature: Temperature for weight scaling
+        
+    Returns:
+        Generator yielding tokens from mixed datasets
+        
+    Example:
+        dataset_config = {
+            "FineWeb": {"path": "path/to/fineweb", "weight": 0.60},
+            "Wikipedia": {"path": "path/to/wiki", "weight": 0.20},
+            "GitHub": {"path": "path/to/github", "weight": 0.20}
+        }
+        
+        token_gen = mixed_token_generator_from_datasets(dataset_config, tokenizer)
+        for token in token_gen:
+            # Use token for training
+    """
+    mixer = DatasetMixer(dataset_config, tokenizer, text_column_map, temperature)
+    return mixer.mixed_token_stream(), mixer
+
+# =============================================================================
 # 7. COGNITIVE MEMORY MANAGER
 # =============================================================================
 
@@ -877,7 +1096,8 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
     
     print(f"\n--- Starting Pre-training (Parquet) | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
     print(f"--- Fuzzy Training Enabled: {fuzzy_steps} Fuzzy / {clear_steps} Clear | Bag Size: {bag_size} ---")
-    print(f"--- Flash Attention: {'Available' if hasattr(F, 'scaled_dot_product_attention') else 'Not Available'} ---")
+    flash_status = 'Enabled' if model.use_flash_attn else 'Disabled (using Bayesian Signal Attention)'
+    print(f"--- Flash Attention: {flash_status} ---")
     
     iteration = start_iteration
     random.shuffle(parquet_files)
@@ -978,7 +1198,7 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
                 print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler, step_type)
                 running_train_loss = 0.0
 
-            if iteration % 20000 == 0:
+            if iteration % 2000 == 0:
                 model.eval()
                 print(f"\n{'='*60}\n[GENERATION SAMPLE (Pre-training Coherence)]\n{'='*60}")
                 test_prompt = "The rapid advancement of artificial intelligence has led to"
@@ -989,11 +1209,156 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
                 print(f"{tokenizer.decode(gen_ids)}\n")
                 model.train()
 
+            if iteration % 20000 == 0:
                 torch.save({
                     'model_state_dict': model.state_dict(), 
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iteration': iteration, 'chunk_size': chunk_size,
                 }, 'checkpoint_ssm_pretrain.pth')
+
+# --- 9A-MIXED. Pre-training with Mixed Datasets (General Language Model) ---
+def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
+                         vocab_size, start_iteration=0, chunk_size=512, enable_forgetting=False, 
+                         batch_size=4, grad_accum_steps=4, fuzzy_steps=1, clear_steps=3, bag_size=2,
+                         text_column_map=None, mix_temperature=1.0, stats_interval=5000):
+    """
+    Pre-training with mixed datasets for general language modeling.
+    
+    Args:
+        dataset_config: Dict of {name: {"path": str, "weight": float}}
+        text_column_map: Dict mapping dataset name to text column name (e.g., {"GitHub": "code"})
+        mix_temperature: Temperature for dataset mixing (lower = more uniform)
+        stats_interval: How often to print mixing statistics
+    """
+    
+    print(f"\n--- Starting MIXED Dataset Pre-training | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
+    print(f"--- Fuzzy Training Enabled: {fuzzy_steps} Fuzzy / {clear_steps} Clear | Bag Size: {bag_size} ---")
+    flash_status = 'Enabled' if model.use_flash_attn else 'Disabled (using Bayesian Signal Attention)'
+    print(f"--- Flash Attention: {flash_status} ---")
+    
+    iteration = start_iteration
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0)
+    
+    ptdtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=(ptdtype == torch.float16))
+    
+    cycle_length = fuzzy_steps + clear_steps
+    
+    # Initialize mixed token stream
+    token_stream, mixer = mixed_token_generator_from_datasets(
+        dataset_config, tokenizer, text_column_map, mix_temperature
+    )
+    
+    buffer = []
+    carry_states, past_key_values, abs_pos_offset = None, None, 0
+    running_train_loss, train_steps = 0.0, 0
+
+    optimizer.zero_grad(set_to_none=True)
+
+    while True:
+        is_fuzzy_step = (fuzzy_steps > 0) and ((iteration % cycle_length) < fuzzy_steps)
+        
+        required_len = (chunk_size + 1) * bag_size if is_fuzzy_step else chunk_size + 1
+        advance_len = chunk_size * bag_size if is_fuzzy_step else chunk_size
+        
+        batch_chunks = []
+        while len(batch_chunks) < batch_size:
+            if len(buffer) >= required_len:
+                batch_chunks.append(buffer[:required_len])
+                buffer = buffer[advance_len:]
+            else:
+                try:
+                    buffer.append(next(token_stream))
+                except StopIteration:
+                    print("[Mixed Dataset] Stream exhausted.")
+                    break
+                    
+        if len(batch_chunks) < batch_size:
+            print("[Mixed Dataset] Insufficient data, ending training.")
+            break 
+            
+        chunk = torch.tensor(batch_chunks, dtype=torch.long, device=device)
+
+        if abs_pos_offset + chunk_size > model.freqs_cis_ext.size(0):
+            carry_states, past_key_values, abs_pos_offset = None, None, 0
+
+        detached_carry = [c.detach() for c in carry_states] if carry_states else None
+        detached_kv = [(k.detach(), v.detach(), s.detach(), kr.detach()) for k, v, s, kr in past_key_values] if past_key_values else None
+
+        with torch.autocast(device_type=device, dtype=ptdtype):
+            if is_fuzzy_step:
+                inputs_flat = chunk[:, :-bag_size]
+                targets_flat = chunk[:, bag_size:]
+                
+                embs = model.tok_embeddings(inputs_flat)
+                embs = embs.view(batch_size, chunk_size, bag_size, -1).mean(dim=2)
+                
+                y_bags = targets_flat.view(batch_size, chunk_size, bag_size)
+                
+                logits, carry_states, past_key_values = model(
+                    inputs_embeds=embs, carry_states=detached_carry, past_key_values=detached_kv, 
+                    is_training=True, use_cache=True, abs_pos_offset=abs_pos_offset
+                )
+                
+                soft_targets = torch.zeros_like(logits).scatter_add_(
+                    -1, y_bags, torch.ones_like(y_bags, dtype=logits.dtype) / bag_size
+                )
+                
+                loss = F.cross_entropy(logits.view(-1, vocab_size), soft_targets.view(-1, vocab_size))
+            else:
+                x, y = chunk[:, :-1], chunk[:, 1:]
+                
+                logits, carry_states, past_key_values = model(
+                    x=x, carry_states=detached_carry, past_key_values=detached_kv, 
+                    is_training=True, use_cache=True, abs_pos_offset=abs_pos_offset
+                )
+                
+                loss = F.cross_entropy(logits.view(-1, vocab_size), y.reshape(-1))
+                
+            abs_pos_offset += chunk_size
+            loss = loss / grad_accum_steps
+        
+        scaler.scale(loss).backward()
+        
+        running_train_loss += loss.item() * grad_accum_steps
+        train_steps += 1
+        
+        if train_steps % grad_accum_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+            
+            iteration += 1
+
+            if iteration % 100 == 0:
+                step_type = "FUZZY" if is_fuzzy_step else "CLEAR"
+                print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler, step_type)
+                running_train_loss = 0.0
+
+            if iteration % stats_interval == 0:
+                mixer.print_statistics()
+
+            if iteration % 2000 == 0:
+                model.eval()
+                print(f"\n{'='*60}\n[GENERATION SAMPLE (Mixed Pre-training Coherence)]\n{'='*60}")
+                test_prompt = "The rapid advancement of artificial intelligence has led to"
+                gen_ids = generate_block_recurrent(
+                    model, tokenizer.encode(test_prompt), tokenizer, device, max_new_tokens=150, 
+                    chunk_size=chunk_size, temperature=0.7
+                )
+                print(f"{tokenizer.decode(gen_ids)}\n")
+                model.train()
+
+            if iteration % 20000 == 0:
+                torch.save({
+                    'model_state_dict': model.state_dict(), 
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'iteration': iteration, 'chunk_size': chunk_size,
+                    'mixer_stats': mixer.get_statistics(),  # Save mixing statistics
+                }, 'checkpoint_ssm_pretrain_mixed.pth')
 
 # --- 9B. Fine-tuning (Masked Instruction Tuning on ChatML JSON with Grad Accum) ---
 def run_finetuning(model, json_file, tokenizer, optimizer, device,
@@ -1001,7 +1366,8 @@ def run_finetuning(model, json_file, tokenizer, optimizer, device,
                    batch_size=2, grad_accum_steps=4, use_streaming=True):
     
     print(f"\n--- Starting ChatML Fine-tuning (OpenHermes) | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
-    print(f"--- Flash Attention: {'Available' if hasattr(F, 'scaled_dot_product_attention') else 'Not Available'} ---")
+    flash_status = 'Enabled' if model.use_flash_attn else 'Disabled (using Bayesian Signal Attention)'
+    print(f"--- Flash Attention: {flash_status} ---")
     iteration = start_iteration
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: 1.0)
 
@@ -1141,7 +1507,7 @@ if __name__ == "__main__":
     print(f"   Device: {device}")
 
     # File Paths Configuration
-    PARQUET_DIR = r"I:\Datasets\fineweb-edu_data_CC-MAIN-2024-10"
+    PARQUET_DIR = r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-10"
     JSON_DATASET_PATH = r"I:\FineTunningDatasets\OpenHermes2.5\openhermes2_5.json" 
     
     MODEL_SIZE = 'medium'
@@ -1152,6 +1518,7 @@ if __name__ == "__main__":
     
     # Optimization Parameters
     SALIENCY_DECAY = 0.95  # Configurable decay factor (was hardcoded to 0.9)
+    USE_FLASH_ATTENTION = False  # Use Flash Attention (True) or Bayesian Signal Attention (False)
     USE_JSON_STREAMING = True  # Memory-efficient streaming for large datasets
     MAX_PARAGRAPH_CACHE = 50  # Limit paragraph states in generation
     
@@ -1171,7 +1538,8 @@ if __name__ == "__main__":
         num_layers=config['num_layers'], 
         max_seq_len=CHUNK_SIZE,
         enable_forgetting=ENABLE_COGNITIVE_FORGETTING,
-        saliency_decay=SALIENCY_DECAY
+        saliency_decay=SALIENCY_DECAY,
+        use_flash_attn=USE_FLASH_ATTENTION
     ).to(device)
     
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
@@ -1183,6 +1551,7 @@ if __name__ == "__main__":
 
     print("\nSelect an operation mode:")
     print("  [1] Pre-train on Plain Text (Parquet) [Fuzzy + Clear Alternating]")
+    print("  [1M] Pre-train on MIXED Datasets (General Language Model)")
     print("  [2] Fine-tune on OpenHermes ChatML (JSON)")
     print("  [3] Chat Mode")
     choice = input("Choice: ").strip()
@@ -1202,6 +1571,45 @@ if __name__ == "__main__":
             model, files, "text", tokenizer, optimizer, device, vocab_size, start_it, 
             CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS,
             FUZZY_STEPS, CLEAR_STEPS, BAG_SIZE
+        )
+    
+    elif choice == '1M' or choice.lower() == '1m':
+        # Mixed dataset configuration - customize paths for your setup
+        DATASET_CONFIG = {
+            "FineWeb":      {"path": r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-10", "weight": 0.60},
+            "Wikipedia":    {"path": r"I:\Datasets\wikipedia_20231101.en", "weight": 0.20},
+            "GitHubCode":   {"path": r"I:\Datasets\github-code_data", "weight": 0.10},
+            "OpenWebMath":  {"path": r"I:\Datasets\OpenWebMath", "weight": 0.07},
+            "Gutenberg":    {"path": r"I:\Datasets\Gutenberg-BookCorpus-Cleaned-Data-English_data", "weight": 0.03}
+        }
+        
+        # Optional: Specify custom text columns for different datasets
+        TEXT_COLUMN_MAP = {
+            "GitHubCode": "text",      # If GitHub dataset uses "code" column
+            # "Wikipedia": "content",  # If Wikipedia uses "content" column
+            # Add more mappings as needed
+        }
+        
+        ckpt_path = 'checkpoint_ssm_pretrain_mixed.pth'
+        start_it = 0
+        if os.path.exists(ckpt_path) and input("Resume mixed pre-training checkpoint? (y/n): ").strip().lower() == 'y':
+            ckpt = torch.load(ckpt_path, map_location=device)
+            load_checkpoint_with_filter(model, ckpt['model_state_dict'])
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            start_it = ckpt.get('iteration', 0)
+            if 'mixer_stats' in ckpt:
+                print("[INFO] Previous mixing statistics:")
+                for name, stats in ckpt['mixer_stats']['per_dataset'].items():
+                    print(f"  {name}: {stats['tokens']:,} tokens ({stats['actual_weight']:.1%})")
+            print("[INFO] Loaded checkpoint (filtered mismatched keys)")
+        
+        run_pretraining_mixed(
+            model, DATASET_CONFIG, tokenizer, optimizer, device, vocab_size, start_it,
+            CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS,
+            FUZZY_STEPS, CLEAR_STEPS, BAG_SIZE,
+            text_column_map=TEXT_COLUMN_MAP,
+            mix_temperature=1.0,        # Temperature for mixing (1.0 = use weights as-is)
+            stats_interval=5000         # Print mixing stats every 5000 iterations
         )
         
     elif choice == '2':
