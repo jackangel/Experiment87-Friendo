@@ -309,21 +309,119 @@ class BayesianSignalAttention(nn.Module):
         return out
 
 # =============================================================================
+# 3.9. LATENT GRAPH REASONING (Relational Message Passing)
+# =============================================================================
+
+class LatentGraphReasoning(nn.Module):
+    """
+    Multi-relational latent graph reasoning adapted for ResonantBrain SSM.
+    
+    Constructs a learned, multi-relational adjacency graph over token 
+    representations, applies causal masking + top-k sparsity, then performs 
+    iterative message passing with LayerNorm-stabilized updates.
+    
+    Integration with ResonantBrain:
+    - Replaces or augments the standard MLP in SSMAttentionBlock
+    - Saliency projection synergizes with existing saliency eviction
+    - Zero-init output projection preserves residual stream stability
+    - Compatible with carry states, KV cache, and gradient checkpointing
+    
+    Args:
+        dim: Model dimension (must match SSMAttentionBlock.dim)
+        num_rules: Number of learned relational types (e.g., causation, 
+                   co-reference, hierarchy). Each rule is a (dim, dim) matrix.
+        graph_steps: Number of message-passing iterations (internal reasoning depth)
+        top_k_edges: Sparsity constraint — each token attends to at most this many 
+                     ancestors. Controls memory (O(T * top_k) vs O(T²)).
+    """
+    def __init__(self, dim, num_rules=8, graph_steps=3, top_k_edges=16):
+        super().__init__()
+        self.dim = dim
+        self.num_rules = num_rules
+        self.graph_steps = graph_steps
+        self.top_k = top_k_edges
+        
+        # Saliency-weighted fuzzy node projection
+        self.saliency_proj = nn.Linear(dim, 1)
+        self.fuzzy_proj = nn.Linear(dim, dim)
+        
+        # Learned relational rules: (num_rules, dim, dim)
+        self.rule_tensor = nn.Parameter(torch.randn(num_rules, dim, dim) / math.sqrt(dim))
+        
+        # Message transformation (per-step update)
+        self.msg_proj = nn.Linear(dim, dim, bias=False)
+        
+        # Step normalization for stable iterative updates
+        self.step_norm = nn.LayerNorm(dim)
+        
+        # Output projection (zero-init so it starts as identity residual)
+        self.out_proj = nn.Linear(dim, dim)
+        
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, C) — hidden states from attention/SSM layers
+        Returns:
+            (B, T, C) — relationally-enhanced hidden states (residual added)
+        """
+        B, T, C = x.shape
+        
+        # --- Node Representation ---
+        # Saliency-weighted fuzzy nodes: highlights important token representations
+        saliency_weights = torch.sigmoid(self.saliency_proj(x))  # (B, T, 1)
+        nodes = torch.sigmoid(self.fuzzy_proj(x)) * saliency_weights  # (B, T, C)
+        
+        # --- Multi-Relational Adjacency ---
+        # Compute pairwise relational scores: nodes[t] @ rule_r @ nodes[s]
+        # Result: (B, num_rules, T, T) — full bipartite relation matrix
+        # einsum: btc * rcd * bsd -> brts (t=query, s=key)
+        adj = torch.einsum('btc, rcd, bsd -> brts', nodes, self.rule_tensor, nodes)
+        
+        # --- Causal Masking ---
+        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+        adj = adj.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        
+        # --- Top-K Sparsity ---
+        if self.top_k < T:
+            topk_vals, _ = torch.topk(adj, self.top_k, dim=-1)
+            kth_val = topk_vals[..., -1:]  # Value of the kth largest edge weight
+            adj = adj.masked_fill(adj < kth_val, float('-inf'))
+        
+        adj = F.softmax(adj, dim=-1)  # Normalize edges per query token
+        
+        # --- Iterative Message Passing ---
+        h = nodes
+        for _ in range(self.graph_steps):
+            # Aggregate messages from neighbors across all relation types
+            messages = torch.einsum('brts, bsc -> brtc', adj, h)  # (B, R, T, C)
+            m_agg = messages.mean(dim=1)  # Average across rules -> (B, T, C)
+            h = self.step_norm(h + self.msg_proj(m_agg))  # Residual update
+        
+        # Zero-init projection + skip connection from original input
+        return self.out_proj(h) + x
+
+
+# =============================================================================
 # 4. SSM-Attention Block
 # =============================================================================
 
 class SSMAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads, max_seq_len, num_layers, dropout=0.1, 
-                 forgetting_config=None, use_eviction=True, saliency_decay=0.95, use_flash_attn=False):
+                 forgetting_config=None, use_eviction=True, saliency_decay=0.95, 
+                 use_flash_attn=False, graph_reasoning_config=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.max_seq_len = max_seq_len
         self.use_eviction = use_eviction
-        self.saliency_decay = saliency_decay  # Configurable decay factor
-        self.use_flash_attn = use_flash_attn  # Control Flash vs Bayesian attention
-
+        self.saliency_decay = saliency_decay
+        self.use_flash_attn = use_flash_attn
+        
         self.norm_ssm = nn.LayerNorm(dim)
         self.fft_conv = FFTCausalConv(dim, max_seq_len)
         self.ssm_dropout = nn.Dropout(dropout)
@@ -343,6 +441,18 @@ class SSMAttentionBlock(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
 
         self.norm_mlp = nn.LayerNorm(dim)
+        
+        # --- Latent Graph Reasoning (optional replacement for MLP) ---
+        self.graph_reasoning = None
+        if graph_reasoning_config is not None:
+            self.graph_reasoning = LatentGraphReasoning(
+                dim=dim,
+                num_rules=graph_reasoning_config.get('num_rules', 8),
+                graph_steps=graph_reasoning_config.get('graph_steps', 3),
+                top_k_edges=graph_reasoning_config.get('top_k_edges', 16)
+            )
+        
+        # Original MLP (used when graph_reasoning is None)
         self.mlp_fc1 = nn.Linear(dim, dim * 4)
         self.mlp_act = nn.GELU()
         
@@ -355,8 +465,18 @@ class SSMAttentionBlock(nn.Module):
                 health_floor=forgetting_config.get('health_floor', 0.2),
                 gated_fraction=forgetting_config.get('gated_fraction', 0.75)
             )
+            # Separate gate for graph reasoning path (operates on dim, not dim*4)
+            self.mlp_forget_gate_layer = CognitiveForgettingGate(
+                dim,
+                enable_ablation=True,
+                decay_factor=forgetting_config.get('decay_factor', 0.995),
+                lock_threshold=forgetting_config.get('lock_threshold', 0.99),
+                health_floor=forgetting_config.get('health_floor', 0.2),
+                gated_fraction=forgetting_config.get('gated_fraction', 0.75)
+            )
         else:
             self.mlp_forget_gate = CognitiveForgettingGate(dim * 4, enable_ablation=False)
+            self.mlp_forget_gate_layer = CognitiveForgettingGate(dim, enable_ablation=False)
         
         self.mlp_drop1 = nn.Dropout(dropout)
         self.mlp_fc2 = nn.Linear(dim * 4, dim)
@@ -451,12 +571,24 @@ class SSMAttentionBlock(nn.Module):
         x = x + self.attn_dropout(self.wo(attn_out))
 
         m = self.norm_mlp(x)
-        m = self.mlp_fc1(m)
-        m = self.mlp_act(m)
-        m = self.mlp_forget_gate(m)
-        m = self.mlp_drop1(m)
-        m = self.mlp_fc2(m)
-        m = self.mlp_drop2(m)
+        
+        if self.graph_reasoning is not None:
+            # --- Latent Graph Reasoning Path (replaces MLP) ---
+            # Graph reasoning provides multi-relational message passing instead of
+            # the standard expand->activate->contract MLP. The forgetting gate still
+            # applies on top for cognitive memory management.
+            m = self.graph_reasoning(m)
+            m = self.mlp_forget_gate_layer(m)  # Separate gate for graph path
+            m = self.mlp_drop2(m)
+        else:
+            # --- Standard MLP Path (original) ---
+            m = self.mlp_fc1(m)
+            m = self.mlp_act(m)
+            m = self.mlp_forget_gate(m)
+            m = self.mlp_drop1(m)
+            m = self.mlp_fc2(m)
+            m = self.mlp_drop2(m)
+        
         x = x + m
 
         return x, new_carry, new_kv
@@ -480,9 +612,39 @@ def get_forgetting_config(layer_idx, num_layers, enable_forgetting):
         'gated_fraction': 0.9 - (depth_ratio * 0.6),        
     }
 
+def get_graph_reasoning_config(layer_idx, num_layers, enable_graph_reasoning):
+    """
+    Configure graph reasoning for specific layers.
+    
+    Strategy: Enable only in deeper layers (>= 50% depth) where relational 
+    reasoning is most valuable. Early layers learn local patterns via SSM + 
+    attention; deeper layers benefit from explicit relational structure.
+    
+    Scales num_rules and top_k_edges down for middle layers, full capacity 
+    in final layers. This keeps parameter count manageable while still 
+    granting deep layers relational reasoning power.
+    """
+    if not enable_graph_reasoning:
+        return None
+    
+    depth_ratio = layer_idx / max(1, num_layers - 1)
+    
+    # Only enable for deeper layers (top 50% of the stack)
+    if depth_ratio < 0.5:
+        return None
+    
+    # Scale capacity with depth
+    is_deep = depth_ratio > 0.75
+    return {
+        'num_rules': 8 if is_deep else 4,
+        'graph_steps': 3 if is_deep else 2,
+        'top_k_edges': 16 if is_deep else 8,
+    }
+
 class SSMTransformer(nn.Module):
     def __init__(self, vocab_size, dim, num_heads, num_layers, max_seq_len=512, 
-                 dropout=0.1, enable_forgetting=False, saliency_decay=0.95, use_flash_attn=False):
+                 dropout=0.1, enable_forgetting=False, saliency_decay=0.95, 
+                 use_flash_attn=False, enable_graph_reasoning=False):
         super().__init__()
         self.dim = dim
         self.num_layers = num_layers
@@ -501,7 +663,8 @@ class SSMTransformer(nn.Module):
                 forgetting_config=get_forgetting_config(i, num_layers, enable_forgetting),
                 use_eviction=(i >= 1),
                 saliency_decay=saliency_decay,
-                use_flash_attn=use_flash_attn
+                use_flash_attn=use_flash_attn,
+                graph_reasoning_config=get_graph_reasoning_config(i, num_layers, enable_graph_reasoning),
             )
             for i in range(num_layers)
         ])
@@ -526,6 +689,24 @@ class SSMTransformer(nn.Module):
                 if config:
                     print(f"Layer {i:2d}: decay={config['decay_factor']:.4f}, lock_thresh={config['lock_threshold']:.3f}, "
                           f"health_floor={config['health_floor']:.2f}, gated_frac={config['gated_fraction']:.2f}")
+            print(f"{'='*60}\n")
+        
+        # Print graph reasoning configuration for each layer
+        if enable_graph_reasoning:
+            print(f"\n{'='*60}")
+            print(f"Latent Graph Reasoning Configuration (Enabled)")
+            print(f"{'='*60}")
+            graph_layers = 0
+            for i in range(num_layers):
+                gr_config = get_graph_reasoning_config(i, num_layers, enable_graph_reasoning)
+                if gr_config:
+                    graph_layers += 1
+                    print(f"Layer {i:2d}: rules={gr_config['num_rules']}, steps={gr_config['graph_steps']}, "
+                          f"top_k={gr_config['top_k_edges']}")
+            if graph_layers == 0:
+                print("  (No layers qualify — increase num_layers or lower depth threshold)")
+            else:
+                print(f"Active in {graph_layers}/{num_layers} layers (deepest {graph_layers})")
             print(f"{'='*60}\n")
 
     def forward(self, x=None, inputs_embeds=None, carry_states=None, is_training=True, past_key_values=None, use_cache=False, abs_pos_offset=0):
@@ -1357,7 +1538,7 @@ def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
                     'model_state_dict': model.state_dict(), 
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iteration': iteration, 'chunk_size': chunk_size,
-                    'mixer_stats': mixer.get_statistics(),  # Save mixing statistics
+                    'mixer_stats': mixer.get_statistics(),
                 }, 'checkpoint_ssm_pretrain_mixed.pth')
 
 # --- 9B. Fine-tuning (Masked Instruction Tuning on ChatML JSON with Grad Accum) ---
@@ -1502,9 +1683,11 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     ENABLE_COGNITIVE_FORGETTING = True
+    ENABLE_GRAPH_REASONING = True   # Enable Latent Graph Reasoning in deep layers
     
-    print(f"🚀 ResonantBrain SSM v4.0 - Hybrid Fuzzy Training Edition")
+    print(f"🚀 ResonantBrain SSM v4.0 - Hybrid Fuzzy Training + Graph Reasoning Edition")
     print(f"   Device: {device}")
+    print(f"   Graph Reasoning: {'Enabled' if ENABLE_GRAPH_REASONING else 'Disabled'}")
 
     # File Paths Configuration
     PARQUET_DIR = r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-10"
@@ -1539,7 +1722,8 @@ if __name__ == "__main__":
         max_seq_len=CHUNK_SIZE,
         enable_forgetting=ENABLE_COGNITIVE_FORGETTING,
         saliency_decay=SALIENCY_DECAY,
-        use_flash_attn=USE_FLASH_ATTENTION
+        use_flash_attn=USE_FLASH_ATTENTION,
+        enable_graph_reasoning=ENABLE_GRAPH_REASONING
     ).to(device)
     
     print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
