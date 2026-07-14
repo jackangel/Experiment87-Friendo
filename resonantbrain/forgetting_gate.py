@@ -30,7 +30,8 @@ class CognitiveForgettingGate(nn.Module):
             self.num_gated = int(hidden_dim * gated_fraction)
             self.num_wildcard = hidden_dim - self.num_gated
 
-            self.register_buffer("health", torch.full((self.num_gated,), 0.5))
+            # Start near 0.85 to prevent massive capacity destruction during early training
+            self.register_buffer("health", torch.full((self.num_gated,), 0.85))
             self.register_buffer("firing_ema", torch.zeros(self.num_gated))
             self.register_buffer("is_locked", torch.zeros(self.num_gated, dtype=torch.bool))
             self.register_buffer("step_count", torch.tensor(0, dtype=torch.long))
@@ -105,6 +106,10 @@ class CognitiveForgettingGate(nn.Module):
                 if lock_step > 40000:
                     newly_locked = (self.health >= self.lock_threshold) & (self.firing_ema > 0.1) & (~self.is_locked)
                     self.is_locked = self.is_locked | newly_locked
+
+                # Depotentiation (LTD): Unlock dimensions that have gone thoroughly dormant
+                unlock_condition = self.is_locked & (self.firing_ema < 0.02)
+                self.is_locked = self.is_locked & (~unlock_condition)
 
                 self.health.masked_fill_(self.is_locked, 1.0)
 

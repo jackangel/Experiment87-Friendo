@@ -76,7 +76,7 @@ def main():
     # state and fed to the routing Linear.
     META_NUM_REGION_CENTROIDS = 8    # Number of coarse region centroids
     META_NUM_SEMANTIC_ANCHORS = 32   # Number of fine-grained semantic anchors
-    META_TEMPORAL_WINDOW = 128         # How many previous tokens for temporal angle
+    META_TEMPORAL_WINDOW = 64         # How many previous tokens for temporal angle
 
     # ── Gaussian (Probabilistic) Embeddings ──────────────────────────────
     # Each token is modelled as N(mu, sigma^2) instead of a fixed point.

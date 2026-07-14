@@ -25,7 +25,7 @@ def get_forgetting_config(layer_idx, num_layers, enable_forgetting):
         'decay_factor': 0.975 + (depth_ratio * 0.018),
 
         # Phase 2 fix: Lowered floor from 0.90 to 0.85 (allows locking at p~0.65)
-        'lock_threshold': 0.85 + (depth_ratio * 0.04),
+        'lock_threshold': 0.75 + (depth_ratio * 0.04),
 
         'health_floor': 0.1 + (depth_ratio * 0.3),
         'gated_fraction': 0.9 - (depth_ratio * 0.6),

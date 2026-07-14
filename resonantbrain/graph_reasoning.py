@@ -40,14 +40,16 @@ class LatentGraphReasoning(nn.Module):
         self.dim = dim
         self.num_rules = num_rules
         self.graph_steps = graph_steps
-        self.top_k = top_k_edges
+        self.head_dim = dim // num_rules
 
         # Saliency-weighted fuzzy node projection
         self.saliency_proj = nn.Linear(dim, 1)
         self.fuzzy_proj = nn.Linear(dim, dim)
 
-        # Learned relational rules: (num_rules, dim, dim)
-        self.rule_tensor = nn.Parameter(torch.randn(num_rules, dim, dim) / math.sqrt(dim))
+        # Learned relational rules via Q/K multi-head projections.
+        # This resolves the O(T^2 * D) bound by mapping to Memory-Efficient SDPA
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
 
         # Message transformation (per-step update)
         self.msg_proj = nn.Linear(dim, dim, bias=False)
@@ -76,31 +78,22 @@ class LatentGraphReasoning(nn.Module):
         saliency_weights = torch.sigmoid(self.saliency_proj(x))  # (B, T, 1)
         nodes = torch.sigmoid(self.fuzzy_proj(x)) * saliency_weights  # (B, T, C)
 
-        # --- Multi-Relational Adjacency ---
-        # Compute pairwise relational scores: nodes[t] @ rule_r @ nodes[s]
-        # Result: (B, num_rules, T, T) — full bipartite relation matrix
-        # einsum: btc * rcd * bsd -> brts (t=query, s=key)
-        adj = torch.einsum('btc, rcd, bsd -> brts', nodes, self.rule_tensor, nodes)
-
-        # --- Causal Masking ---
-        causal_mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-        adj = adj.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-
-        # --- Top-K Sparsity ---
-        if self.top_k < T:
-            topk_vals, _ = torch.topk(adj, self.top_k, dim=-1)
-            kth_val = topk_vals[..., -1:]  # Value of the kth largest edge weight
-            adj = adj.masked_fill(adj < kth_val, float('-inf'))
-
-        adj = F.softmax(adj, dim=-1)  # Normalize edges per query token
+        # --- Multi-Relational Adjacency (Flash MHA implementation) ---
+        Q = self.q_proj(nodes).view(B, T, self.num_rules, self.head_dim).transpose(1, 2)
+        K = self.k_proj(nodes).view(B, T, self.num_rules, self.head_dim).transpose(1, 2)
 
         # --- Iterative Message Passing ---
         h = nodes
         for _ in range(self.graph_steps):
-            # Aggregate messages from neighbors across all relation types
-            messages = torch.einsum('brts, bsc -> brtc', adj, h)  # (B, R, T, C)
-            m_agg = messages.mean(dim=1)  # Average across rules -> (B, T, C)
-            h = self.step_norm(h + self.msg_proj(m_agg))  # Residual update
+            V = h.view(B, T, self.num_rules, self.head_dim).transpose(1, 2)
+            
+            # Using PyTorch SDPA completely avoids manifesting the O(R * T^2) explicit block in memory!
+            messages = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
+            
+            # Concatenate rules together rather than taking .mean()
+            messages = messages.transpose(1, 2).contiguous().view(B, T, C)
+            
+            h = self.step_norm(h + self.msg_proj(messages))  # Residual update
 
         # Zero-init projection + skip connection from original input
         return self.out_proj(h) + x

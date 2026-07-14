@@ -192,18 +192,14 @@ class MetaDynamicPhase(nn.Module):
         anchor_sim = x_norm @ anchors_norm.T  # (B, L, A)
 
         # C. Temporal angles (cosine sim to k-th previous token)
-        temporal_sims = []
-        for k in range(1, self.temporal_window + 1):
-            if L > k:
-                # Cosine similarity between x[t] and x[t-k] for positions t >= k.
-                sim = (x_norm[:, k:] * x_norm[:, :-k]).sum(dim=-1)  # (B, L-k)
-                # Left-pad with zeros for positions [0, k) with no predecessor.
-                pad = x.new_zeros(B, k)
-                sim = torch.cat([pad, sim], dim=1)  # (B, L)
-            else:
-                sim = x.new_zeros(B, L)
-            temporal_sims.append(sim)
-        temporal_cat = torch.stack(temporal_sims, dim=-1)  # (B, L, T)
+        # Vectorized via tensor unfolding (eliminates 128 kernel launches)
+        pad_x = F.pad(x_norm, (0, 0, self.temporal_window, 0))  # (B, L+W, D)
+        x_prevs = pad_x.unfold(1, self.temporal_window, 1)[:, :-1, :, :]  # (B, L, D, W)
+        
+        # Inner product across the D dimension.
+        # unfold ordering means index W-1 is t-1, W-2 is t-2. We flip to match original k=1..W order
+        temporal_cat = (x_norm.unsqueeze(-1) * x_prevs).sum(dim=2)  # (B, L, W)
+        temporal_cat = torch.flip(temporal_cat, dims=[-1])
 
         # Concatenate all features → (B, L, geo_feature_dim)
         return torch.cat([centroid_sim, anchor_sim, temporal_cat], dim=-1)
@@ -315,19 +311,13 @@ class MetaDynamicPhase(nn.Module):
             # Only charge the router for compute it FREELY chose, not for the
             # tokens we forced to explore.  Average over unforced tokens.
             n_unforced = unforced_mask.sum()
-            if n_unforced.item() > 0.0:
-                denom = n_unforced.clamp(min=1.0)
-                total_penalty = total_penalty + \
-                    (unforced_mask * (1.0 - exit_prob)).sum() / denom
-            # exit_counts reflects only free (unforced) decisions, so the
-            # training log shows what the router is actually learning rather
-            # than what we forced.
-            if n_unforced.item() > 0.0:
-                exit_counts.append(
-                    ((unforced_mask * exit_prob).sum()
-                     / n_unforced.clamp(min=1.0)).item())
-            else:
-                exit_counts.append(0.0)
+            denom = n_unforced.clamp(min=1.0)
+            
+            # Unforced_mask cancels out terms when n_unforced is 0; avoids .item() host syncs
+            total_penalty = total_penalty + (unforced_mask * (1.0 - exit_prob)).sum() / denom
+            
+            # Store tensor to avoid synchronizing the GPU execution pipeline
+            exit_counts.append(((unforced_mask * exit_prob).sum() / denom).detach())
 
             # Early termination: at inference, if ALL tokens chose EXIT, stop.
             if not is_training and exit_prob.min().item() >= 0.999:
@@ -369,7 +359,7 @@ class MetaDynamicPhase(nn.Module):
 
         # Save stats for the training loop / logging.
         self.last_compute_penalty = total_penalty.detach()
-        self.last_exit_stats = exit_counts
+        self.last_exit_stats = [p.item() if isinstance(p, torch.Tensor) else p for p in exit_counts]
         self.last_entropy_per_step = entropy_per_step  # Per-step entropy for diagnostics
         # Average per-step entropy (detached for logging metrics only; the
         # gradient-bearing version is returned separately).
