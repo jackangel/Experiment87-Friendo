@@ -307,7 +307,8 @@ def print_gate_stats(model, iteration, running_loss, train_steps, scheduler, ste
 
 
 def build_cosine_scheduler(optimizer, start_iteration, peak_lr,
-                           warmup_iters=200, max_iters=100000, min_lr_ratio=0.1):
+                           warmup_iters=200, max_iters=100000, min_lr_ratio=0.1,
+                           forced_lr=None):
     """
     Create a LambdaLR scheduler implementing linear warmup + cosine decay.
 
@@ -316,9 +317,13 @@ def build_cosine_scheduler(optimizer, start_iteration, peak_lr,
       • step [warmup_iters, max_iters) → cosine decay peak_lr → peak_lr * min_lr_ratio
       • step >= max_iters              → plateau at   peak_lr * min_lr_ratio
 
-    Resets optimizer param_group LRs to `peak_lr` before binding the schedule,
-    which makes checkpoint-resume correct (the optimizer_state_dict checkpoint
-    contains an already-decayed LR that must NOT become the new base).
+    Resets optimizer param_group LRs to `peak_lr` (scaled per-group by each
+    param group's own ``lr_multiplier``, defaulting to 1.0) before binding
+    the schedule, which makes checkpoint-resume correct (the
+    optimizer_state_dict checkpoint contains an already-decayed LR that must
+    NOT become the new base) while preserving any differential LR ratios
+    between groups (e.g. a meta-router group intentionally trained at 0.3x
+    the base LR).
 
     Args:
         optimizer:      The torch optimizer.
@@ -327,15 +332,38 @@ def build_cosine_scheduler(optimizer, start_iteration, peak_lr,
         warmup_iters:   Number of optimizer steps to linearly warm up over.
         max_iters:      Step at which the cosine reaches the minimum LR.
         min_lr_ratio:   Final LR as a fraction of peak_lr (e.g. 0.1 → 10%).
+        forced_lr:      If set, overrides the entire warmup/cosine/plateau
+            schedule with a constant LR. Each param group is reset to
+            ``forced_lr * pg['lr_multiplier']`` and the schedule's lambda is
+            pinned at 1.0, so the forced value survives every subsequent
+            ``scheduler.step()`` call unchanged (including replay below and
+            every step taken during training).
 
     Returns:
         torch.optim.lr_scheduler.LambdaLR
     """
-    # Reset base LR so the schedule multiplies from the true peak.
+    # Reset base LR so the schedule multiplies from the true peak (or the
+    # forced override), preserving each group's own relative multiplier
+    # instead of flattening every group to the same absolute value.
+    #
+    # IMPORTANT: also force-reset 'initial_lr' on every param group, not just
+    # 'lr'. LambdaLR's __init__ does `group.setdefault('initial_lr', group['lr'])`,
+    # which does NOT overwrite an existing 'initial_lr' key. If this optimizer
+    # was restored via optimizer.load_state_dict() from an older checkpoint
+    # that already had a scheduler bound to it, 'initial_lr' is still present
+    # (baked in from whatever peak_lr was used the very first time), so the
+    # new scheduler would silently keep computing its schedule from that
+    # stale value forever -- completely ignoring the peak_lr/forced_lr passed
+    # in here. Explicitly overwriting 'initial_lr' guarantees the fresh value
+    # is actually used.
+    base_value = forced_lr if forced_lr is not None else peak_lr
     for pg in optimizer.param_groups:
-        pg['lr'] = peak_lr
+        pg['lr'] = base_value * pg.get('lr_multiplier', 1.0)
+        pg['initial_lr'] = pg['lr']
 
     def lr_lambda(step):
+        if forced_lr is not None:
+            return 1.0
         if step < warmup_iters:
             return float(step + 1) / float(max(1, warmup_iters))
         if step >= max_iters:
@@ -357,17 +385,21 @@ def build_cosine_scheduler(optimizer, start_iteration, peak_lr,
 def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, device,
                     vocab_size, start_iteration=0, chunk_size=512, enable_forgetting=False,
                     batch_size=4, grad_accum_steps=4,
-                    peak_lr=4e-4, warmup_iters=200, max_iters=100000, min_lr_ratio=0.1):
+                    peak_lr=4e-4, warmup_iters=200, max_iters=100000, min_lr_ratio=0.1,
+                    forced_lr=None):
 
     print(f"\n--- Starting Pre-training (Parquet) | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
     flash_status = 'Enabled' if model.use_flash_attn else 'Disabled (using Bayesian Signal Attention)'
     print(f"--- Flash Attention: {flash_status} ---")
-    print(f"--- LR Schedule: Warmup {warmup_iters} steps → Cosine decay to {min_lr_ratio*100:.0f}% over {max_iters} steps ---")
+    if forced_lr is not None:
+        print(f"--- FORCED LR OVERRIDE ACTIVE: pinning base LR to {forced_lr:.2e} (schedule below is ignored) ---")
+    else:
+        print(f"--- LR Schedule: Warmup {warmup_iters} steps → Cosine decay to {min_lr_ratio*100:.0f}% over {max_iters} steps ---")
 
     iteration = start_iteration
     random.shuffle(parquet_files)
 
-    scheduler = build_cosine_scheduler(optimizer, start_iteration, peak_lr, warmup_iters, max_iters, min_lr_ratio)
+    scheduler = build_cosine_scheduler(optimizer, start_iteration, peak_lr, warmup_iters, max_iters, min_lr_ratio, forced_lr=forced_lr)
 
     ptdtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=(ptdtype == torch.float16))
@@ -480,7 +512,8 @@ def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
                          vocab_size, start_iteration=0, chunk_size=512, enable_forgetting=False,
                          batch_size=4, grad_accum_steps=4,
                          text_column_map=None, mix_temperature=1.0, stats_interval=5000,
-                         peak_lr=4e-4, warmup_iters=200, max_iters=100000, min_lr_ratio=0.1):
+                         peak_lr=4e-4, warmup_iters=200, max_iters=100000, min_lr_ratio=0.1,
+                         forced_lr=None):
     """
     Pre-training with mixed datasets for general language modeling.
 
@@ -493,15 +526,20 @@ def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
         warmup_iters: Number of warmup steps
         max_iters: Total training steps (where LR reaches minimum)
         min_lr_ratio: Final LR as fraction of peak_lr
+        forced_lr: If set, overrides the schedule with a constant pinned LR
+            (see build_cosine_scheduler for details).
     """
 
     print(f"\n--- Starting MIXED Dataset Pre-training | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
     flash_status = 'Enabled' if model.use_flash_attn else 'Disabled (using Bayesian Signal Attention)'
     print(f"--- Flash Attention: {flash_status} ---")
-    print(f"--- LR Schedule: Warmup {warmup_iters} steps → Cosine decay to {min_lr_ratio*100:.0f}% over {max_iters} steps ---")
+    if forced_lr is not None:
+        print(f"--- FORCED LR OVERRIDE ACTIVE: pinning base LR to {forced_lr:.2e} (schedule below is ignored) ---")
+    else:
+        print(f"--- LR Schedule: Warmup {warmup_iters} steps → Cosine decay to {min_lr_ratio*100:.0f}% over {max_iters} steps ---")
 
     iteration = start_iteration
-    scheduler = build_cosine_scheduler(optimizer, start_iteration, peak_lr, warmup_iters, max_iters, min_lr_ratio)
+    scheduler = build_cosine_scheduler(optimizer, start_iteration, peak_lr, warmup_iters, max_iters, min_lr_ratio, forced_lr=forced_lr)
 
     ptdtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=(ptdtype == torch.float16))
@@ -621,15 +659,19 @@ def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
 def run_finetuning(model, json_file, tokenizer, optimizer, device,
                    vocab_size, start_iteration=0, chunk_size=512, enable_forgetting=False,
                    batch_size=2, grad_accum_steps=4, use_streaming=True,
-                   peak_lr=1e-4, warmup_iters=100, max_iters=50000, min_lr_ratio=0.1):
+                   peak_lr=1e-4, warmup_iters=100, max_iters=50000, min_lr_ratio=0.1,
+                   forced_lr=None):
 
     print(f"\n--- Starting ChatML Fine-tuning (OpenHermes) | Device: {device} | Batch Size: {batch_size} | Grad Accum: {grad_accum_steps} ---")
     flash_status = 'Enabled' if model.use_flash_attn else 'Disabled (using Bayesian Signal Attention)'
     print(f"--- Flash Attention: {flash_status} ---")
-    print(f"--- LR Schedule: Warmup {warmup_iters} steps → Cosine decay to {min_lr_ratio*100:.0f}% over {max_iters} steps ---")
+    if forced_lr is not None:
+        print(f"--- FORCED LR OVERRIDE ACTIVE: pinning base LR to {forced_lr:.2e} (schedule below is ignored) ---")
+    else:
+        print(f"--- LR Schedule: Warmup {warmup_iters} steps → Cosine decay to {min_lr_ratio*100:.0f}% over {max_iters} steps ---")
 
     iteration = start_iteration
-    scheduler = build_cosine_scheduler(optimizer, start_iteration, peak_lr, warmup_iters, max_iters, min_lr_ratio)
+    scheduler = build_cosine_scheduler(optimizer, start_iteration, peak_lr, warmup_iters, max_iters, min_lr_ratio, forced_lr=forced_lr)
 
     token_stream = stream_chatml_from_json(json_file, tokenizer, chunk_size, device, batch_size, use_streaming)
 

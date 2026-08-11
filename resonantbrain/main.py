@@ -95,14 +95,48 @@ def main():
           + (f" (max_steps={META_MAX_STEPS}, tau={META_GUMBEL_TAU})" if ENABLE_META_ROUTING else ""))
 
     # File Paths Configuration
-    PARQUET_DIR = r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-10"
+    PARQUET_DIR = r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-51"
     JSON_DATASET_PATH = r"I:\FineTunningDatasets\OpenHermes2.5\openhermes2_5.json"
 
     MODEL_SIZE = 'medium'
     CHUNK_SIZE = 768
     BATCH_SIZE = 1
     GRAD_ACCUM_STEPS = 4
-    LEARNING_RATE = 4e-4
+    LEARNING_RATE = 1e-5
+    
+    # Learning Rate Multipliers for Specialized Components
+    # Meta routing network learns slower to prevent premature convergence and routing collapse
+    META_ROUTER_LR_MULTIPLIER = 0.3  # Meta router, step embeddings, dynamic layer (0.1-0.5 recommended)
+    # Geometric features (centroids/anchors) learn slower to provide stable reference points
+    META_FEATURES_LR_MULTIPLIER = 0.5  # Region centroids, semantic anchors (0.3-0.7 recommended)
+
+    # LR Schedule shape (linear warmup → cosine decay → plateau at min_lr_ratio).
+    # Shared across all training modes so LEARNING_RATE above is actually honored
+    # as the schedule's peak (previously the run_* calls omitted these, silently
+    # falling back to each function's own default peak_lr).
+    WARMUP_ITERS = 200
+    MAX_ITERS = 100000
+    MIN_LR_RATIO = 0.1
+
+    # ── Forced Learning Rate Override ─────────────────────────────────────
+    # Once training has run past MAX_ITERS for a long time (e.g. 500k+ steps),
+    # the cosine schedule locks the LR at LEARNING_RATE * MIN_LR_RATIO forever.
+    # Enable this to override the checkpoint/scheduler LR with an explicit
+    # value on resume (or a fresh start) — e.g. to push the LR even lower than
+    # the schedule's floor. The differential multipliers above
+    # (META_ROUTER_LR_MULTIPLIER / META_FEATURES_LR_MULTIPLIER) are still
+    # applied on top of the forced base value.
+    FORCED_LEARNING_RATE = True        # Set True to override the LR schedule
+    FORCED_LEARNING_RATE_VALUE = 2e-5   # New base LR to force when enabled
+
+    if FORCED_LEARNING_RATE and FORCED_LEARNING_RATE_VALUE <= 0:
+        raise ValueError(
+            f"FORCED_LEARNING_RATE_VALUE must be > 0, got {FORCED_LEARNING_RATE_VALUE}"
+        )
+    _forced_lr = FORCED_LEARNING_RATE_VALUE if FORCED_LEARNING_RATE else None
+    if FORCED_LEARNING_RATE:
+        print(f"   Forced LR Override: ENABLED — pinning base LR to {FORCED_LEARNING_RATE_VALUE:.2e} "
+              f"(differential multipliers still applied on top)")
 
     # Optimization Parameters
     SALIENCY_DECAY = 0.95  # Configurable decay factor (was hardcoded to 0.9)
@@ -141,8 +175,89 @@ def main():
 
     validate_vocab_size(model, tokenizer)
 
+    # ========================================================================
+    # PARAMETER GROUPING FOR DIFFERENTIAL LEARNING RATES
+    # ========================================================================
+    # Group parameters by component to apply different learning rates:
+    #   1. Meta routing network: slower LR for stability
+    #   2. Geometric features: slower LR for stable reference points
+    #   3. Base model: full LR
+    
+    def group_parameters_by_component(model, base_lr, meta_router_mult, meta_features_mult):
+        """Group model parameters by component for differential learning rates.
+        
+        Returns:
+            List of param groups for optimizer: [{params, lr, name}, ...]
+        """
+        meta_router_params = []
+        meta_features_params = []
+        base_params = []
+        
+        # Named parameters for identification
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            # Meta routing network components
+            if 'meta_phase' in name:
+                if 'region_centroids' in name or 'semantic_anchors' in name:
+                    # Geometric features get their own group
+                    meta_features_params.append(param)
+                else:
+                    # meta_net, step_embeddings, dynamic_layer
+                    meta_router_params.append(param)
+            else:
+                # Everything else: embeddings, fixed layers, output projection
+                base_params.append(param)
+        
+        param_groups = [
+            {
+                'params': base_params,
+                'lr': base_lr,
+                'lr_multiplier': 1.0,
+                'name': 'base_model'
+            },
+            {
+                'params': meta_router_params,
+                'lr': base_lr * meta_router_mult,
+                'lr_multiplier': meta_router_mult,
+                'name': 'meta_router'
+            },
+            {
+                'params': meta_features_params,
+                'lr': base_lr * meta_features_mult,
+                'lr_multiplier': meta_features_mult,
+                'name': 'meta_features'
+            }
+        ]
+        
+        # Print parameter group statistics
+        print(f"\n{'='*70}")
+        print("[PARAMETER GROUPING - Differential Learning Rates]")
+        print(f"{'='*70}")
+        for group in param_groups:
+            num_params = sum(p.numel() for p in group['params'])
+            lr_ratio = group['lr'] / base_lr
+            print(f"  {group['name']:<20} {num_params:>12,} params | LR: {group['lr']:.2e} ({lr_ratio:.1%} of base)")
+        print(f"{'='*70}\n")
+        
+        return param_groups
+    
+    # Create parameter groups with differential learning rates
+    if ENABLE_META_ROUTING:
+        param_groups = group_parameters_by_component(
+            model,
+            base_lr=LEARNING_RATE,
+            meta_router_mult=META_ROUTER_LR_MULTIPLIER,
+            meta_features_mult=META_FEATURES_LR_MULTIPLIER
+        )
+    else:
+        # No meta routing - use uniform learning rate
+        param_groups = [{'params': model.parameters(), 'lr': LEARNING_RATE, 'lr_multiplier': 1.0}]
+        print(f"[INFO] Meta routing disabled - using uniform LR: {LEARNING_RATE:.2e}\n")
+    
     use_fused = True if device == 'cuda' else False
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01, fused=use_fused)
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, fused=use_fused)
 
     print("\nSelect an operation mode:")
     print("  [1] Pre-train on Plain Text (Parquet)")
@@ -173,12 +288,14 @@ def main():
         run_pretraining(
             model, files, "text", tokenizer, optimizer, device, vocab_size, start_it,
             CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS,
+            peak_lr=LEARNING_RATE, warmup_iters=WARMUP_ITERS, max_iters=MAX_ITERS, min_lr_ratio=MIN_LR_RATIO,
+            forced_lr=_forced_lr,
         )
 
     elif choice == '1M' or choice.lower() == '1m':
         # Mixed dataset configuration - customize paths for your setup
         DATASET_CONFIG = {
-            "FineWeb":      {"path": r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-10", "weight": 0.60},
+            "FineWeb":      {"path": r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-26", "weight": 0.60},
             "Wikipedia":    {"path": r"I:\Datasets\wikipedia_20231101.en", "weight": 0.20},
             "GitHubCode":   {"path": r"I:\Datasets\github-code_data", "weight": 0.10},
             "OpenWebMath":  {"path": r"I:\Datasets\OpenWebMath", "weight": 0.07},
@@ -218,7 +335,9 @@ def main():
             CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS,
             text_column_map=TEXT_COLUMN_MAP,
             mix_temperature=1.0,        # Temperature for mixing (1.0 = use weights as-is)
-            stats_interval=5000         # Print mixing stats every 5000 iterations
+            stats_interval=5000,        # Print mixing stats every 5000 iterations
+            peak_lr=LEARNING_RATE, warmup_iters=WARMUP_ITERS, max_iters=MAX_ITERS, min_lr_ratio=MIN_LR_RATIO,
+            forced_lr=_forced_lr,
         )
 
     elif choice == '2':
@@ -250,7 +369,9 @@ def main():
         else:
             run_finetuning(
                 model, JSON_DATASET_PATH, tokenizer, optimizer, device, vocab_size, start_it,
-                CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS, USE_JSON_STREAMING
+                CHUNK_SIZE, ENABLE_COGNITIVE_FORGETTING, BATCH_SIZE, GRAD_ACCUM_STEPS, USE_JSON_STREAMING,
+                peak_lr=LEARNING_RATE, warmup_iters=WARMUP_ITERS, max_iters=MAX_ITERS, min_lr_ratio=MIN_LR_RATIO,
+                forced_lr=_forced_lr,
             )
 
     elif choice == '3':

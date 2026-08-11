@@ -341,9 +341,21 @@ class MetaDynamicPhase(nn.Module):
                 cur_carry = new_carry
                 cur_kv = new_kv
             else:
-                # INFERENCE: only run the layer if at least one token wants it.
-                # Tokens that chose EXIT simply keep `x`.
-                if apply_prob.max().item() > 0.001:
+                # INFERENCE:
+                # When use_cache=True (autoregressive generation), ALWAYS run the
+                # dynamic layer even if every token chose EXIT.  Skipping it would
+                # leave a positional hole in the KV cache: the next token that does
+                # APPLY would attend over a cache that is missing this position's
+                # K/V entry, corrupting the relative-position encoding for all
+                # subsequent tokens.  The routing decision still controls the
+                # hidden-state blend (EXIT tokens keep `x` unchanged), so the
+                # semantic routing semantics are fully preserved; we only pay one
+                # extra layer forward when all tokens exit — negligible for L=1.
+                #
+                # When use_cache=False (offline scoring, no generation), the skip
+                # is still safe because no KV state is carried between calls.
+                should_run = use_cache or (apply_prob.max().item() > 0.001)
+                if should_run:
                     layer_out, new_carry, new_kv = self.dynamic_layer(
                         x_with_step, freqs_cis_ext,
                         abs_pos_offset=abs_pos_offset,
@@ -355,7 +367,7 @@ class MetaDynamicPhase(nn.Module):
                     x = apply_prob * layer_out + exit_prob * x
                     cur_carry = new_carry
                     cur_kv = new_kv
-                # else: every token EXITed this step → nothing to do.
+                # else: not caching and all tokens exited → safe to skip.
 
         # Save stats for the training loop / logging.
         self.last_compute_penalty = total_penalty.detach()
