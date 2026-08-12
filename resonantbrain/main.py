@@ -260,10 +260,12 @@ def main():
     optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01, fused=use_fused)
 
     print("\nSelect an operation mode:")
-    print("  [1] Pre-train on Plain Text (Parquet)")
+    print("  [1]  Pre-train on Plain Text (Parquet)")
     print("  [1M] Pre-train on MIXED Datasets (General Language Model)")
-    print("  [2] Fine-tune on OpenHermes ChatML (JSON)")
-    print("  [3] Chat Mode")
+    print("  [2]  Fine-tune on OpenHermes ChatML (JSON)")
+    print("  [3]  Chat Mode")
+    print("  [4]  Inspect Checkpoint (iters / tokens / config)")
+    print("  [5]  Run Benchmark (lm-eval-harness)")
     choice = input("Choice: ").strip()
 
     if choice == '1':
@@ -295,7 +297,7 @@ def main():
     elif choice == '1M' or choice.lower() == '1m':
         # Mixed dataset configuration - customize paths for your setup
         DATASET_CONFIG = {
-            "FineWeb":      {"path": r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-26", "weight": 0.60},
+            "FineWeb":      {"path": r"I:\Datasets\FineWeb\fineweb-edu_data_CC-MAIN-2024-30", "weight": 0.60},
             "Wikipedia":    {"path": r"I:\Datasets\wikipedia_20231101.en", "weight": 0.20},
             "GitHubCode":   {"path": r"I:\Datasets\github-code_data", "weight": 0.10},
             "OpenWebMath":  {"path": r"I:\Datasets\OpenWebMath", "weight": 0.07},
@@ -389,6 +391,106 @@ def main():
             load_checkpoint_with_filter(model, ckpt['model_state_dict'])
 
         chat_mode(model, tokenizer, device, chunk_size=ckpt.get('chunk_size', CHUNK_SIZE))
+
+    elif choice == '4':
+        # ── Inspect a checkpoint: iters / tokens / config ─────────────────
+        from .inspect_checkpoint import inspect_checkpoint
+
+        # Default to the mixed-pretraining base model, then fall back to any
+        # checkpoint that exists in the repo root.
+        default_ckpt = None
+        for cand in ('checkpoint_ssm_pretrain_mixed.pth',
+                     'checkpoint_ssm_pretrain.pth',
+                     'checkpoint_ssm_finetune.pth'):
+            if os.path.exists(cand):
+                default_ckpt = cand
+                break
+
+        print("\n=== Checkpoint Inspector ===")
+        print(f"Default checkpoint: {default_ckpt or '(none found)'}")
+        ckpt_in = input("Path to checkpoint [ENTER for default]: ").strip()
+        ckpt_path = ckpt_in or default_ckpt
+        if not ckpt_path:
+            print("[ERROR] No checkpoint specified and none found in the repo root.")
+        elif not os.path.exists(ckpt_path):
+            print(f"[ERROR] Checkpoint not found: {ckpt_path!r}")
+        else:
+            inspect_checkpoint(ckpt_path)
+
+    elif choice == '5':
+        # ── Run an lm-evaluation-harness benchmark on a trained checkpoint ──
+        from .benchmark import run_benchmark
+
+        # Prompt for which checkpoint to load.  Prefer the mixed-pretraining
+        # base model by default, falling back to whatever exists.
+        default_ckpt = None
+        for cand in ('checkpoint_ssm_pretrain_mixed.pth',
+                     'checkpoint_ssm_pretrain.pth',
+                     'checkpoint_ssm_finetune.pth'):
+            if os.path.exists(cand):
+                default_ckpt = cand
+                break
+
+        print("\n=== Benchmark Mode (lm-evaluation-harness) ===")
+        print("This loads a trained checkpoint and runs standard LLM benchmarks")
+        print("(MMLU, HellaSwag, ARC, WinoGrande, ...).")
+        print(f"\nDefault checkpoint: {default_ckpt or '(none found)'}")
+        ckpt_in = input("Path to checkpoint [ENTER for default]: ").strip()
+        ckpt_path = ckpt_in or default_ckpt
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            print(f"[ERROR] Checkpoint not found: {ckpt_path!r}")
+        else:
+            print("\nPopular task presets:")
+            print("  [a] Quick (HellaSwag + ARC-easy/challenge + WinoGrande + PIQA)")
+            print("  [b] MMLU (full 57-subject suite -- slow)")
+            print("  [c] Custom (enter comma-separated lm-eval task IDs)")
+            print("  [d] Smoke test (100 docs per task, HellaSwag+ARC-easy)")
+            tpreset = input("Preset [a/b/c/d]: ").strip().lower()
+
+            if tpreset == 'a':
+                tasks = ['hellaswag', 'arc_easy', 'arc_challenge', 'winogrande', 'piqa']
+            elif tpreset == 'b':
+                tasks = ['mmlu']
+            elif tpreset == 'd':
+                tasks = ['hellaswag', 'arc_easy']
+            else:
+                custom = input("Task IDs (comma-separated): ").strip()
+                tasks = [t.strip() for t in custom.split(',') if t.strip()]
+
+            limit = 100 if tpreset == 'd' else None
+            out_path = input("Output JSON path [results.json]: ").strip() or 'results.json'
+            n_fs = input("Num few-shot examples [ENTER for task default]: ").strip()
+            num_fewshot = int(n_fs) if n_fs.isdigit() else None
+
+            # NOTE: run_benchmark() builds and loads its own model instance with
+            # the exact architecture flags below, so the model constructed at
+            # the top of main() is not reused here (avoids stale-weight bugs).
+            run_benchmark(
+                checkpoint_path=ckpt_path,
+                tasks=tasks,
+                model_size=MODEL_SIZE,
+                chunk_size=CHUNK_SIZE,
+                batch_size=BATCH_SIZE,
+                device=device,
+                enable_forgetting=ENABLE_COGNITIVE_FORGETTING,
+                saliency_decay=SALIENCY_DECAY,
+                use_flash_attn=USE_FLASH_ATTENTION,
+                enable_graph_reasoning=ENABLE_GRAPH_REASONING,
+                enable_meta_routing=ENABLE_META_ROUTING,
+                meta_max_steps=META_MAX_STEPS,
+                meta_gumbel_tau=META_GUMBEL_TAU,
+                meta_force_explore_eps=META_FORCE_EXPLORE_EPS,
+                meta_entropy_weight=META_ENTROPY_WEIGHT,
+                meta_penalty_collapse_floor=META_PENALTY_COLLAPSE_FLOOR,
+                meta_num_region_centroids=META_NUM_REGION_CENTROIDS,
+                meta_num_semantic_anchors=META_NUM_SEMANTIC_ANCHORS,
+                meta_temporal_window=META_TEMPORAL_WINDOW,
+                enable_gaussian_embeddings=ENABLE_GAUSSIAN_EMBEDDINGS,
+                kl_weight=KL_WEIGHT,
+                num_fewshot=num_fewshot,
+                output_path=out_path,
+                limit=limit,
+            )
 
     else:
         print(f"Invalid choice: {choice}")

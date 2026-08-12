@@ -28,6 +28,30 @@ from .tokenizer import CHAT_START, CHAT_END
 
 
 # =============================================================================
+# TOKEN-COUNT HELPERS
+# =============================================================================
+def format_token_count(n_tokens: int) -> str:
+    """Human-readable token count, e.g. 3.07B, 12.4M, 850k."""
+    abs_n = abs(n_tokens)
+    if abs_n >= 1_000_000_000:
+        return f"{n_tokens / 1_000_000_000:.2f}B"
+    if abs_n >= 1_000_000:
+        return f"{n_tokens / 1_000_000:.2f}M"
+    if abs_n >= 1_000:
+        return f"{n_tokens / 1_000:.1f}k"
+    return str(n_tokens)
+
+
+def tokens_for_steps(steps: int, chunk_size: int, batch_size: int, grad_accum_steps: int) -> int:
+    """Equivalent forward-pass token count for a number of optimizer steps.
+
+    One optimizer step = ``grad_accum_steps`` micro-batches, each containing
+    ``batch_size`` sequences of ``chunk_size`` tokens.
+    """
+    return int(steps) * int(chunk_size) * int(batch_size) * int(grad_accum_steps)
+
+
+# =============================================================================
 # ADVANCED DIAGNOSTICS (comprehensive health monitoring)
 # =============================================================================
 
@@ -223,9 +247,11 @@ def _collect_all_gates(model):
     return gates
 
 
-def print_gate_stats(model, iteration, running_loss, train_steps, scheduler, step_type="CLEAR"):
+def print_gate_stats(model, iteration, running_loss, train_steps, scheduler, step_type="CLEAR",
+                     tokens_seen=None):
     current_lr = scheduler.get_last_lr()[0]
-    log_str = f"[Step {iteration}] Type: {step_type:5s} | Loss: {running_loss / max(1, train_steps):.4f} | LR: {current_lr:.2e}"
+    tok_str = f" | Tokens: {format_token_count(tokens_seen)} ({tokens_seen:,})" if tokens_seen else ""
+    log_str = f"[Step {iteration}] Type: {step_type:5s} | Loss: {running_loss / max(1, train_steps):.4f} | LR: {current_lr:.2e}{tok_str}"
 
     # --- CE-only loss + clean token PPL (Phase 1.4) ---
     # running_loss above may include KL + meta penalty + entropy bonus, so
@@ -478,7 +504,9 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
             model.global_training_iteration.add_(1)
 
             if iteration % 100 == 0:
-                print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler)
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
+                print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler,
+                                 tokens_seen=tokens_seen)
                 running_train_loss = 0.0
 
             # Detailed diagnostics every 500 steps
@@ -487,7 +515,8 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
 
             if iteration % 2000 == 0:
                 model.eval()
-                print(f"\n{'='*60}\n[GENERATION SAMPLE (Pre-training Coherence)]\n{'='*60}")
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
+                print(f"\n{'='*60}\n[GENERATION SAMPLE (Pre-training Coherence)] Tokens: {format_token_count(tokens_seen)}\n{'='*60}")
                 test_prompt = "The rapid advancement of artificial intelligence has led to"
                 gen_ids = generate_block_recurrent(
                     model, tokenizer.encode(test_prompt), tokenizer, device, max_new_tokens=150,
@@ -497,10 +526,13 @@ def run_pretraining(model, parquet_files, text_column, tokenizer, optimizer, dev
                 model.train()
 
             if iteration % 20000 == 0:
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iteration': iteration, 'chunk_size': chunk_size,
+                    'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
+                    'tokens_seen': tokens_seen,
                 }, 'checkpoint_ssm_pretrain.pth')
 
 
@@ -622,7 +654,9 @@ def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
             model.global_training_iteration.add_(1)
 
             if iteration % 100 == 0:
-                print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler)
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
+                print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler,
+                                 tokens_seen=tokens_seen)
                 running_train_loss = 0.0
 
             # Detailed diagnostics every 500 steps
@@ -634,7 +668,8 @@ def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
 
             if iteration % 2000 == 0:
                 model.eval()
-                print(f"\n{'='*60}\n[GENERATION SAMPLE (Mixed Pre-training Coherence)]\n{'='*60}")
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
+                print(f"\n{'='*60}\n[GENERATION SAMPLE (Mixed Pre-training Coherence)] Tokens: {format_token_count(tokens_seen)}\n{'='*60}")
                 test_prompt = "The rapid advancement of artificial intelligence has led to"
                 gen_ids = generate_block_recurrent(
                     model, tokenizer.encode(test_prompt), tokenizer, device, max_new_tokens=150,
@@ -644,10 +679,13 @@ def run_pretraining_mixed(model, dataset_config, tokenizer, optimizer, device,
                 model.train()
 
             if iteration % 20000 == 0:
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iteration': iteration, 'chunk_size': chunk_size,
+                    'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
+                    'tokens_seen': tokens_seen,
                     'mixer_stats': mixer.get_statistics(),
                 }, 'checkpoint_ssm_pretrain_mixed.pth')
 
@@ -728,7 +766,9 @@ def run_finetuning(model, json_file, tokenizer, optimizer, device,
             model.global_training_iteration.add_(1)
 
             if iteration % 100 == 0:
-                print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler, "CLEAR")
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
+                print_gate_stats(model, iteration, running_train_loss, grad_accum_steps * 100, scheduler, "CLEAR",
+                                 tokens_seen=tokens_seen)
                 running_train_loss = 0.0
 
             # Detailed diagnostics every 500 steps
@@ -737,7 +777,8 @@ def run_finetuning(model, json_file, tokenizer, optimizer, device,
 
             if iteration % 2000 == 0:
                 model.eval()
-                print(f"\n{'='*60}\n[GENERATION SAMPLE (Instruction Following)]\n{'='*60}")
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
+                print(f"\n{'='*60}\n[GENERATION SAMPLE (Instruction Following)] Tokens: {format_token_count(tokens_seen)}\n{'='*60}")
                 test_prompt = f"{CHAT_START}user\nWhat is the purpose of AI fine-tuning?{CHAT_END}\n{CHAT_START}assistant\n"
                 gen_ids = generate_block_recurrent(
                     model, tokenizer.encode(test_prompt), tokenizer, device, max_new_tokens=150,
@@ -746,8 +787,11 @@ def run_finetuning(model, json_file, tokenizer, optimizer, device,
                 print(f"{tokenizer.decode(gen_ids)}\n")
                 model.train()
 
+                tokens_seen = tokens_for_steps(iteration, chunk_size, batch_size, grad_accum_steps)
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iteration': iteration, 'chunk_size': chunk_size,
+                    'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
+                    'tokens_seen': tokens_seen,
                 }, 'checkpoint_ssm_finetune.pth')
